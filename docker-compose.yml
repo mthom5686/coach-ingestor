@@ -13,7 +13,7 @@ services:
     volumes:
       - coachdb_data:/var/lib/postgresql/data
     ports:
-      - "100.89.255.16:5435:5432"
+      - "5435:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coach -d coach"]
       interval: 10s
