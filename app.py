@@ -1,19 +1,24 @@
+# app.py
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
-from pydantic import BaseModel, Field
-from typing import Optional
-from datetime import date, datetime
 from fastapi.responses import HTMLResponse
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
+from typing import Optional
 from datetime import date, datetime
 import os, io, csv, json, re
 import httpx
 from bs4 import BeautifulSoup
 
-from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, JSON, UniqueConstraint, BigInteger
+from sqlalchemy import (
+    create_engine, Column, Integer, String, Date, ForeignKey, JSON,
+    UniqueConstraint, BigInteger
+)
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.exc import IntegrityError
 
-# ----- DB setup -----
+# =========================
+# DB setup
+# =========================
 DB_HOST = os.getenv("DB_HOST", "coachdb")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "coach")
@@ -25,7 +30,9 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-# ----- Models -----
+# =========================
+# Models
+# =========================
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -64,7 +71,9 @@ class NutritionLog(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ----- Schemas -----
+# =========================
+# Schemas
+# =========================
 class UserCreate(BaseModel):
     name: str = Field(..., min_length=2)
     protein_target: Optional[int] = None
@@ -76,7 +85,8 @@ class UserOut(BaseModel):
     id: int
     name: str
     protein_target: Optional[int] = None
-    class Config: from_attributes = True
+    class Config:
+        from_attributes = True
 
 class HevyIn(BaseModel):
     url: str
@@ -96,30 +106,43 @@ class NutritionManualIn(BaseModel):
     carbs_g: Optional[int] = None
     fat_g: Optional[int] = None
 
-# ----- FastAPI -----
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.2")
 
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try:
+        yield db
+    finally:
+        db.close()
 
 @app.get("/health")
-def health(): return {"ok": True, "ts": datetime.utcnow().isoformat()}
+def health():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-# ----- CRUD helpers -----
+# =========================
+# CRUD helpers
+# =========================
 def get_or_create_user(db: Session, name: str, **kwargs) -> User:
     u = db.query(User).filter(User.name == name).first()
     if u:
         for k, v in kwargs.items():
-            if v is not None and hasattr(u, k): setattr(u, k, v)
-        db.commit(); db.refresh(u); return u
-    u = User(name=name, **kwargs); db.add(u); db.commit(); db.refresh(u); return u
+            if v is not None and hasattr(u, k):
+                setattr(u, k, v)
+        db.commit()
+        db.refresh(u)
+        return u
+    u = User(name=name, **kwargs)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
 
 def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volume: int|None, url: str, raw: dict|None):
     safe_raw = None
     if raw is not None:
-        # Convert date/datetime (and any other non-JSON types) to strings
         safe_raw = jsonable_encoder(
             raw,
             custom_encoder={
@@ -143,11 +166,20 @@ def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volu
 def upsert_nutrition(db: Session, user_id: int, dt: date, protein_g: int|None, calories: int|None, carbs_g: int|None, fat_g: int|None, source: str="api"):
     log = db.query(NutritionLog).filter(NutritionLog.user_id==user_id, NutritionLog.date==dt).first()
     if not log:
-        log = NutritionLog(user_id=user_id, date=dt); db.add(log)
-    log.protein_g, log.calories, log.carbs_g, log.fat_g, log.source = protein_g, calories, carbs_g, fat_g, source
-    db.commit(); db.refresh(log); return log
+        log = NutritionLog(user_id=user_id, date=dt)
+        db.add(log)
+    log.protein_g = protein_g
+    log.calories = calories
+    log.carbs_g = carbs_g
+    log.fat_g = fat_g
+    log.source = source
+    db.commit()
+    db.refresh(log)
+    return log
 
-# ----- HTTP fetch headers (more browser-like) -----
+# =========================
+# HTTP fetch headers (browser-like)
+# =========================
 HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -159,7 +191,9 @@ HTTP_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
-# ----- Hevy parser (robust) -----
+# =========================
+# Hevy parser (robust)
+# =========================
 def extract_next_data(html: str) -> dict | None:
     m = re.search(r'<script[^>]+id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', html, re.S | re.I)
     if not m:
@@ -216,7 +250,7 @@ def parse_hevy_share(url: str) -> dict:
     with httpx.Client(
         timeout=httpx.Timeout(8.0, connect=5.0, read=8.0),
         follow_redirects=True,
-        headers=HTTP_HEADERS | {"Referer": "https://hevy.com/"},
+        headers={**HTTP_HEADERS, "Referer": "https://hevy.com/"},
         transport=httpx.HTTPTransport(retries=2),
     ) as client:
         r = client.get(url)
@@ -296,14 +330,19 @@ def parse_hevy_share(url: str) -> dict:
         "raw_hint": "Parsed from Hevy share (weights normalized to kg)",
     }
 
-# ----- Routes -----
+# =========================
+# Routes
+# =========================
 @app.post("/users", response_model=UserOut)
 def create_user(body: UserCreate, db: Session = Depends(get_db)):
-    return get_or_create_user(db, name=body.name,
-                              protein_target=body.protein_target,
-                              nutrition_provider=body.nutrition_provider,
-                              nutrition_api_base=body.nutrition_api_base,
-                              nutrition_api_key=body.nutrition_api_key)
+    return get_or_create_user(
+        db,
+        name=body.name,
+        protein_target=body.protein_target,
+        nutrition_provider=body.nutrition_provider,
+        nutrition_api_base=body.nutrition_api_base,
+        nutrition_api_key=body.nutrition_api_key,
+    )
 
 @app.get("/users", response_model=list[UserOut])
 def list_users(db: Session = Depends(get_db)):
@@ -337,7 +376,8 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
         existing.duration_minutes = parsed.get("duration_minutes")
         existing.total_volume = parsed.get("total_volume")
         existing.raw = safe_raw
-        db.commit(); db.refresh(existing)
+        db.commit()
+        db.refresh(existing)
         w = existing
     else:
         try:
@@ -349,7 +389,9 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
                 source_url=body.url,
                 raw=safe_raw,
             )
-            db.add(w); db.commit(); db.refresh(w)
+            db.add(w)
+            db.commit()
+            db.refresh(w)
         except IntegrityError:
             # extremely rare race: re-fetch row and update
             db.rollback()
@@ -363,7 +405,8 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
             existing.duration_minutes = parsed.get("duration_minutes")
             existing.total_volume = parsed.get("total_volume")
             existing.raw = safe_raw
-            db.commit(); db.refresh(existing)
+            db.commit()
+            db.refresh(existing)
             w = existing
 
     return HevyWorkoutOut(
@@ -376,9 +419,11 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
 @app.post("/ingest/nutrition/manual")
 def ingest_nutrition_manual(body: NutritionManualIn, db: Session = Depends(get_db)):
     user = get_or_create_user(db, name=body.user_name)
-    upsert_nutrition(db, user_id=user.id, dt=body.date,
-                     protein_g=body.protein_g, calories=body.calories,
-                     carbs_g=body.carbs_g, fat_g=body.fat_g, source="manual")
+    upsert_nutrition(
+        db, user_id=user.id, dt=body.date,
+        protein_g=body.protein_g, calories=body.calories,
+        carbs_g=body.carbs_g, fat_g=body.fat_g, source="manual"
+    )
     return {"ok": True}
 
 @app.post("/ingest/nutrition/csv")
@@ -393,11 +438,14 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
         calories = int(float(row.get("calories", 0))) if row.get("calories") else None
         carbs = int(float(row.get("carbs_g", 0))) if row.get("carbs_g") else None
         fat = int(float(row.get("fat_g", 0))) if row.get("fat_g") else None
-        upsert_nutrition(db, user_id=user.id, dt=dt, protein_g=protein,
-                         calories=calories, carbs_g=carbs, fat_g=fat, source="csv")
+        upsert_nutrition(
+            db, user_id=user.id, dt=dt, protein_g=protein,
+            calories=calories, carbs_g=carbs, fat_g=fat, source="csv"
+        )
         n += 1
     return {"ok": True, "rows": n}
 
+# --- debug: recent workouts
 @app.get("/debug/workouts")
 def debug_workouts(user_name: Optional[str] = None, limit: int = 10, db: Session = Depends(get_db)):
     q = db.query(HevyWorkout, User).join(User, HevyWorkout.user_id == User.id)
@@ -406,14 +454,14 @@ def debug_workouts(user_name: Optional[str] = None, limit: int = 10, db: Session
     rows = q.order_by(HevyWorkout.id.desc()).limit(limit).all()
     return [{"user": u.name, "date": w.date.isoformat(), "volume": w.total_volume, "url": w.source_url} for (w, u) in rows]
 
-# --- tiny debug endpoints ---
+# --- debug: parse a hevy link without inserting
 @app.get("/debug/hevy")
 def debug_hevy(url: str):
     try:
         parsed = parse_hevy_share(url)
         return {
             "ok": True,
-            "date": parsed.get("date"),
+            "date": parsed.get("date").isoformat() if parsed.get("date") else None,
             "duration_minutes": parsed.get("duration_minutes"),
             "total_volume": parsed.get("total_volume"),
             "exercise_count": len(parsed.get("exercises") or []),
@@ -421,6 +469,7 @@ def debug_hevy(url: str):
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+# --- debug: nutrition rows
 @app.get("/debug/nutrition")
 def debug_nutrition(user_name: Optional[str] = None, limit: int = 20, db: Session = Depends(get_db)):
     q = db.query(NutritionLog, User).join(User, NutritionLog.user_id == User.id)
@@ -432,13 +481,14 @@ def debug_nutrition(user_name: Optional[str] = None, limit: int = 20, db: Sessio
         for (n, u) in rows
     ]
 
+# --- debug: raw fetch tester
 @app.get("/debug/fetch")
 def debug_fetch(url: str):
     try:
         with httpx.Client(
             timeout=httpx.Timeout(8.0, connect=5.0, read=8.0),
             follow_redirects=True,
-            headers=HTTP_HEADERS | {"Referer": "https://hevy.com/"},
+            headers={**HTTP_HEADERS, "Referer": "https://hevy.com/"},
             transport=httpx.HTTPTransport(retries=2),
         ) as client:
             r = client.get(url)
@@ -446,7 +496,9 @@ def debug_fetch(url: str):
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-# --- Simple homepage (unchanged except version bump) ---
+# =========================
+# Simple homepage
+# =========================
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -458,8 +510,6 @@ def home():
     <title>LiftCrew – Submit</title>
     <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2/css/pico.min.css">
     <style>
-      .container { max-width: 880px; margin: 2rem auto; }
-      <style>
       .container { max-width: 880px; margin: 2rem auto; }
       .card { padding: 1.25rem; border: 1px solid #e7e7e9; border-radius: 12px; }
       .grid { display: grid; gap: 1rem; grid-template-columns: 1fr; }
@@ -558,10 +608,12 @@ def home():
       } catch (e) { showToast('Could not load users', true); }
     }
 
+    // Link your Grafana board here (optional)
     document.getElementById('grafanaHref').href = 'http://<YOUR-SERVER>:3030/d/<UID>/<slug>?orgId=1&var-user=All&kiosk';
     document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
     document.getElementById('dashLink').setAttribute('target','_blank');
 
+    // Hevy submit
     document.getElementById('hevyForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const user = document.getElementById('hevyUser').value;
@@ -578,6 +630,7 @@ def home():
       } catch(err){ showToast('Submit failed', true); }
     });
 
+    // Protein submit
     document.getElementById('protForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const user = document.getElementById('protUser').value;
@@ -594,6 +647,7 @@ def home():
       } catch(err){ showToast('Save failed', true); }
     });
 
+    // Defaults
     document.getElementById('protDate').valueAsDate = new Date();
     loadUsers();
     </script>
