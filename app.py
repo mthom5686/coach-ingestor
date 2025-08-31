@@ -109,7 +109,7 @@ class NutritionManualIn(BaseModel):
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.2")
+app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.3")
 
 def get_db():
     db = SessionLocal()
@@ -192,7 +192,7 @@ HTTP_HEADERS = {
 }
 
 # =========================
-# Hevy parser (robust)
+# Hevy parser helpers
 # =========================
 def extract_next_data(html: str) -> dict | None:
     m = re.search(r'<script[^>]+id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', html, re.S | re.I)
@@ -247,17 +247,13 @@ def _weight_kg_from_set(s: dict):
 
 def parse_duration_minutes(val, key_hint: str = "") -> int | None:
     """
-    Return duration in whole minutes from many possible shapes:
-    - int/float seconds or minutes (key_hint helps disambiguate)
-    - strings like 'PT1H23M', '1:23:45', '83 min', '1 h 23 m', '5000s'
-    - dicts like {'value': 4980, 'unit': 's'} or {'minutes': 83}
+    Return duration in minutes from many shapes.
     """
     if val is None:
         return None
 
     # Dict forms
     if isinstance(val, dict):
-        # direct minute/second fields
         for kk in ("minutes", "mins", "min"):
             if kk in val and val[kk] is not None:
                 try:
@@ -270,7 +266,6 @@ def parse_duration_minutes(val, key_hint: str = "") -> int | None:
                     return int(round(float(val[kk]) / 60.0))
                 except Exception:
                     pass
-        # value + unit
         unit = str(val.get("unit", "")).lower()
         if "value" in val and val["value"] is not None:
             try:
@@ -281,24 +276,31 @@ def parse_duration_minutes(val, key_hint: str = "") -> int | None:
                     return int(round(v))
             except Exception:
                 pass
-        # generic numeric field
         for kk in ("value", "val", "amount", "duration"):
             if kk in val and val[kk] is not None:
                 return parse_duration_minutes(val[kk], key_hint)
-
-        # unknown dict
         return None
 
     # Numeric forms
     if isinstance(val, (int, float)):
         v = float(val)
         kh = key_hint.lower()
+
+        # treat obviously-milliseconds as seconds
+        if v >= 1e10:
+            v = v / 1000.0  # ms -> s
+
         if any(x in kh for x in ("sec", "second")):
             return int(round(v / 60.0))
         if any(x in kh for x in ("min", "minute")):
             return int(round(v))
-        # heuristic: if it's big, assume seconds
-        if v > 600:  # >10 minutes → likely seconds
+
+        # if absurdly huge (seconds > 3 days) it's likely a timestamp -> reject
+        if v > 60 * 60 * 24 * 3:
+            return None
+
+        # if moderately large, assume seconds; else minutes
+        if v > 600:
             return int(round(v / 60.0))
         return int(round(v))
 
@@ -334,7 +336,7 @@ def parse_duration_minutes(val, key_hint: str = "") -> int | None:
             if total > 0:
                 return total
 
-        # bare number + unit inside the same string
+        # bare number + unit
         m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(min|mins|minute|minutes|m)\b", s)
         if m:
             return int(round(float(m.group(1))))
@@ -348,9 +350,32 @@ def parse_duration_minutes(val, key_hint: str = "") -> int | None:
             v = float(m.group(1))
             return parse_duration_minutes(v, key_hint)
 
-    # Unknown type
     return None
 
+def duration_from_text(page_text: str) -> int | None:
+    """
+    Parse visible durations like '83 min' or '1 h 23 min' from page text.
+    Accepts h/hr/hrs/hour/hours and m/min/mins/minute/minutes.
+    """
+    s = re.sub(r"\s+", " ", (page_text or "").lower()).strip()
+
+    m = re.search(r"(\d{1,2})\s*(?:h|hr|hrs|hour|hours)\s*(\d{1,2})\s*(?:m|min|mins|minute|minutes)\b", s)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+
+    m = re.search(r"(\d{1,2})\s*(?:h|hr|hrs|hour|hours)\b", s)
+    if m:
+        return int(m.group(1)) * 60
+
+    m = re.search(r"(\d{1,3})\s*(?:m|min|mins|minute|minutes)\b", s)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+# =========================
+# Hevy parser (main)
+# =========================
 def parse_hevy_share(url: str) -> dict:
     # Short timeouts + retries + Referer so we fail fast and get clearer errors
     with httpx.Client(
@@ -364,6 +389,7 @@ def parse_hevy_share(url: str) -> dict:
         html = r.text
 
     soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
 
     data_sources = []
     nd = extract_next_data(html)
@@ -396,31 +422,38 @@ def parse_hevy_share(url: str) -> dict:
                         parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            # --- duration: scan *all* keys that look like duration/time/elapsed ---
+            # --- duration: only accept duration/elapsed-ish keys (avoid timestamps like startTime) ---
             if duration_minutes is None and isinstance(node, dict):
                 for k, v in node.items():
                     kl = str(k).lower()
-                    if any(key in kl for key in ("duration", "time", "elapsed")):
+                    if ("duration" in kl) or ("elapsed" in kl) or (kl in ("workoutduration", "durationminutes", "durationsecs", "durationseconds")):
                         mins = parse_duration_minutes(v, key_hint=kl)
-                        if mins is not None and mins > 0:
+                        if mins is not None and 1 <= mins <= 600:
                             duration_minutes = mins
-                            break  # keep the first plausible hit
+                            break
 
             # --- date/time (unchanged) ---
             if not wdate:
                 wdate = node.get("date") or node.get("startTime") or node.get("startDate") or node.get("workoutDate")
 
-    # Fallback: try to pull an ISO-8601 duration or textual duration directly from the HTML if still missing
+    # Fallback: parse from visible text like "1 h 23 min" or "83 min"
+    if duration_minutes is None:
+        mins = duration_from_text(page_text)
+        if mins is not None and 1 <= mins <= 600:
+            duration_minutes = mins
+
+    # Fallback: look for ISO-8601 duration string if still missing
     if duration_minutes is None:
         html_lower = html.lower()
         m = re.search(r"pt(?:\d+h)?(?:\d+m)?(?:\d+s)?", html_lower)
         if m:
-            duration_minutes = parse_duration_minutes(m.group(0))
-    if duration_minutes is None:
-        # simple textual fallback like "83 min", "1 h 23 m"
-        m = re.search(r"(\d+)\s*h(?:\s*(\d+)\s*m)?", html_lower) or re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?\b", html_lower)
-        if m:
-            duration_minutes = parse_duration_minutes(m.group(0))
+            mins = parse_duration_minutes(m.group(0))
+            if mins is not None and 1 <= mins <= 600:
+                duration_minutes = mins
+
+    # Final plausibility cap
+    if duration_minutes is not None and not (1 <= duration_minutes <= 600):
+        duration_minutes = None
 
     total_volume = 0
     for e in exercises:
