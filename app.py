@@ -5,13 +5,14 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
+from decimal import Decimal
 import os, io, csv, json, re
 import httpx
 from bs4 import BeautifulSoup
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Date, ForeignKey, JSON,
-    UniqueConstraint, BigInteger
+    UniqueConstraint, BigInteger, Numeric, text
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from sqlalchemy.exc import IntegrityError
@@ -38,11 +39,22 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, unique=True, nullable=False)
     protein_target = Column(Integer, nullable=True)
+
+    # new goal fields (added at runtime via ALTER TABLE IF NOT EXISTS)
+    # stored as columns but defined here for ORM usage
+    # (metadata.create_all doesn't add columns to existing table, so we DDL them at startup)
+    # types match the ALTER TABLE below:
+    # goal_weight_kg: Numeric(6,2)   goal_date: Date
+    goal_weight_kg = Column(Numeric(6, 2), nullable=True)
+    goal_date = Column(Date, nullable=True)
+
     nutrition_provider = Column(String, nullable=True)
     nutrition_api_base = Column(String, nullable=True)
     nutrition_api_key = Column(String, nullable=True)
+
     workouts = relationship("HevyWorkout", back_populates="user", cascade="all, delete-orphan")
     nutrition_logs = relationship("NutritionLog", back_populates="user", cascade="all, delete-orphan")
+    weight_logs = relationship("WeightLog", back_populates="user", cascade="all, delete-orphan")
 
 class HevyWorkout(Base):
     __tablename__ = "hevy_workouts"
@@ -69,7 +81,26 @@ class NutritionLog(Base):
     user = relationship("User", back_populates="nutrition_logs")
     __table_args__ = (UniqueConstraint("user_id", "date", name="uq_nutrition_user_date"),)
 
+class WeightLog(Base):
+    __tablename__ = "weight_logs"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    date = Column(Date, index=True, nullable=False)
+    weight_kg = Column(Numeric(6, 2), nullable=False)
+    source = Column(String, nullable=True)
+    user = relationship("User", back_populates="weight_logs")
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_weight_user_date"),)
+
+# Create tables that don't exist
 Base.metadata.create_all(bind=engine)
+
+# Add new columns to users table if missing
+def init_schema():
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_weight_kg numeric(6,2)"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_date date"))
+
+init_schema()
 
 # =========================
 # Schemas
@@ -81,10 +112,17 @@ class UserCreate(BaseModel):
     nutrition_api_base: Optional[str] = None
     nutrition_api_key: Optional[str] = None
 
+class GoalIn(BaseModel):
+    user_name: str
+    goal_weight_kg: float
+    goal_date: date
+
 class UserOut(BaseModel):
     id: int
     name: str
     protein_target: Optional[int] = None
+    goal_weight_kg: Optional[float] = None
+    goal_date: Optional[date] = None
     class Config:
         from_attributes = True
 
@@ -106,10 +144,15 @@ class NutritionManualIn(BaseModel):
     carbs_g: Optional[int] = None
     fat_g: Optional[int] = None
 
+class WeightManualIn(BaseModel):
+    user_name: str
+    date: date
+    weight_kg: float
+
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.3")
+app = FastAPI(title="Coach Ingestor API (single-file)", version="0.2.0")
 
 def get_db():
     db = SessionLocal()
@@ -166,16 +209,19 @@ def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volu
 def upsert_nutrition(db: Session, user_id: int, dt: date, protein_g: int|None, calories: int|None, carbs_g: int|None, fat_g: int|None, source: str="api"):
     log = db.query(NutritionLog).filter(NutritionLog.user_id==user_id, NutritionLog.date==dt).first()
     if not log:
-        log = NutritionLog(user_id=user_id, date=dt)
+        log = NutritionLog(user_id=user_id, date=dt); db.add(log)
+    log.protein_g, log.calories, log.carbs_g, log.fat_g, log.source = protein_g, calories, carbs_g, fat_g, source
+    db.commit(); db.refresh(log); return log
+
+def upsert_weight(db: Session, user_id: int, dt: date, weight_kg: float|Decimal, source: str="manual"):
+    log = db.query(WeightLog).filter(WeightLog.user_id==user_id, WeightLog.date==dt).first()
+    if not log:
+        log = WeightLog(user_id=user_id, date=dt, weight_kg=Decimal(str(weight_kg)), source=source)
         db.add(log)
-    log.protein_g = protein_g
-    log.calories = calories
-    log.carbs_g = carbs_g
-    log.fat_g = fat_g
-    log.source = source
-    db.commit()
-    db.refresh(log)
-    return log
+    else:
+        log.weight_kg = Decimal(str(weight_kg))
+        log.source = source
+    db.commit(); db.refresh(log); return log
 
 # =========================
 # HTTP fetch headers (browser-like)
@@ -192,7 +238,7 @@ HTTP_HEADERS = {
 }
 
 # =========================
-# Hevy parser helpers
+# Hevy parser (robust)
 # =========================
 def extract_next_data(html: str) -> dict | None:
     m = re.search(r'<script[^>]+id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', html, re.S | re.I)
@@ -213,14 +259,11 @@ def walk_obj(obj):
             yield from walk_obj(it)
 
 def _num_from_any(x):
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
+    if x is None: return None
+    if isinstance(x, (int, float)): return float(x)
     if isinstance(x, dict):
         for k in ("kg", "value", "val", "amount", "weight"):
-            if k in x:
-                return _num_from_any(x[k])
+            if k in x: return _num_from_any(x[k])
         return None
     if isinstance(x, str):
         m = re.search(r'[-+]?\d*\.?\d+', x)
@@ -237,147 +280,69 @@ def _weight_kg_from_set(s: dict):
     raw = next((c for c in candidates if c not in (None, "")), None)
     val = _num_from_any(raw)
     txt = str(raw).lower()
-    looks_lb = ("weightlbs" in s or "lbs" in txt or " lb" in txt or unit in ("lb", "lbs", "pounds"))
-    looks_kg = ("kg" in txt) or ("weightkg" in s) or (unit in ("kg", "kilogram", "kilograms"))
-    if val is None:
-        return 0.0
-    if looks_lb and not looks_kg:
-        return round(val * 0.45359237, 3)
+    looks_lb = ("lbs" in txt or " lb" in txt or unit in ("lb", "lbs", "pounds"))
+    looks_kg = ("kg" in txt) or (unit in ("kg", "kilogram", "kilograms"))
+    if val is None: return 0.0
+    if looks_lb and not looks_kg: return round(val * 0.45359237, 3)
     return float(val)
 
 def parse_duration_minutes(val, key_hint: str = "") -> int | None:
-    """
-    Return duration in minutes from many shapes.
-    """
-    if val is None:
-        return None
-
-    # Dict forms
+    if val is None: return None
     if isinstance(val, dict):
-        for kk in ("minutes", "mins", "min"):
+        for kk in ("minutes","mins","min"):
             if kk in val and val[kk] is not None:
-                try:
-                    return int(round(float(val[kk])))
-                except Exception:
-                    pass
-        for kk in ("seconds", "secs", "sec"):
+                try: return int(round(float(val[kk])))
+                except: pass
+        for kk in ("seconds","secs","sec"):
             if kk in val and val[kk] is not None:
-                try:
-                    return int(round(float(val[kk]) / 60.0))
-                except Exception:
-                    pass
+                try: return int(round(float(val[kk]) / 60.0))
+                except: pass
         unit = str(val.get("unit", "")).lower()
         if "value" in val and val["value"] is not None:
             try:
                 v = float(val["value"])
-                if unit in ("s", "sec", "secs", "second", "seconds"):
-                    return int(round(v / 60.0))
-                if unit in ("m", "min", "mins", "minute", "minutes"):
-                    return int(round(v))
-            except Exception:
-                pass
-        for kk in ("value", "val", "amount", "duration"):
+                if unit in ("s","sec","secs","second","seconds"): return int(round(v/60.0))
+                if unit in ("m","min","mins","minute","minutes"): return int(round(v))
+            except: pass
+        for kk in ("value","val","amount","duration"):
             if kk in val and val[kk] is not None:
                 return parse_duration_minutes(val[kk], key_hint)
         return None
-
-    # Numeric forms
     if isinstance(val, (int, float)):
-        v = float(val)
-        kh = key_hint.lower()
-
-        # treat obviously-milliseconds as seconds
-        if v >= 1e10:
-            v = v / 1000.0  # ms -> s
-
-        if any(x in kh for x in ("sec", "second")):
-            return int(round(v / 60.0))
-        if any(x in kh for x in ("min", "minute")):
-            return int(round(v))
-
-        # if absurdly huge (seconds > 3 days) it's likely a timestamp -> reject
-        if v > 60 * 60 * 24 * 3:
-            return None
-
-        # if moderately large, assume seconds; else minutes
-        if v > 600:
-            return int(round(v / 60.0))
+        v = float(val); kh = key_hint.lower()
+        if any(x in kh for x in ("sec","second")): return int(round(v/60.0))
+        if any(x in kh for x in ("min","minute")): return int(round(v))
+        if v > 600: return int(round(v/60.0))
         return int(round(v))
-
-    # String forms
     if isinstance(val, str):
         s = val.strip().lower()
-
-        # ISO-8601 like PT1H23M45S
         m = re.match(r"^pt(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", s)
         if m:
-            h = int(m.group(1) or 0)
-            mi = int(m.group(2) or 0)
-            se = int(m.group(3) or 0)
-            return h * 60 + mi + int(round(se / 60.0))
-
-        # hh:mm:ss or mm:ss
+            h = int(m.group(1) or 0); mi = int(m.group(2) or 0); se = int(m.group(3) or 0)
+            return h*60 + mi + int(round(se/60.0))
         m = re.match(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$", s)
         if m:
-            h = int(m.group(1) or 0)
-            mi = int(m.group(2) or 0)
-            se = int(m.group(3) or 0)
-            return h * 60 + mi + int(round(se / 60.0))
-
-        # textual "1 h 23 m", "83 min", "5000 s"
+            h = int(m.group(1) or 0); mi = int(m.group(2) or 0); se = int(m.group(3) or 0)
+            return h*60 + mi + int(round(se/60.0))
         h = re.search(r"(\d+)\s*h", s)
         mi = re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?\b", s)
         se = re.search(r"(\d+)\s*s(?:ec(?:ond)?s?)?\b", s)
         if h or mi or se:
             total = 0
-            if h: total += int(h.group(1)) * 60
+            if h: total += int(h.group(1))*60
             if mi: total += int(mi.group(1))
-            if se: total += int(round(int(se.group(1)) / 60.0))
-            if total > 0:
-                return total
-
-        # bare number + unit
+            if se: total += int(round(int(se.group(1))/60.0))
+            if total > 0: return total
         m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(min|mins|minute|minutes|m)\b", s)
-        if m:
-            return int(round(float(m.group(1))))
+        if m: return int(round(float(m.group(1))))
         m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(sec|secs|second|seconds|s)\b", s)
-        if m:
-            return int(round(float(m.group(1)) / 60.0))
-
-        # bare number: fall back with key hint
+        if m: return int(round(float(m.group(1))/60.0))
         m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*$", s)
         if m:
-            v = float(m.group(1))
-            return parse_duration_minutes(v, key_hint)
-
+            v = float(m.group(1)); return parse_duration_minutes(v, key_hint)
     return None
 
-def duration_from_text(page_text: str) -> int | None:
-    """
-    Parse visible durations like '83 min' or '1 h 23 min' from page text.
-    Accepts h/hr/hrs/hour/hours and m/min/mins/minute/minutes.
-    """
-    s = re.sub(r"\s+", " ", (page_text or "").lower()).strip()
-
-    m = re.search(r"(\d{1,2})\s*(?:h|hr|hrs|hour|hours)\s*(\d{1,2})\s*(?:m|min|mins|minute|minutes)\b", s)
-    if m:
-        return int(m.group(1)) * 60 + int(m.group(2))
-
-    m = re.search(r"(\d{1,2})\s*(?:h|hr|hrs|hour|hours)\b", s)
-    if m:
-        return int(m.group(1)) * 60
-
-    m = re.search(r"(\d{1,3})\s*(?:m|min|mins|minute|minutes)\b", s)
-    if m:
-        return int(m.group(1))
-
-    return None
-
-# =========================
-# Hevy parser (main)
-# =========================
 def parse_hevy_share(url: str) -> dict:
-    # Short timeouts + retries + Referer so we fail fast and get clearer errors
     with httpx.Client(
         timeout=httpx.Timeout(8.0, connect=5.0, read=8.0),
         follow_redirects=True,
@@ -389,18 +354,14 @@ def parse_hevy_share(url: str) -> dict:
         html = r.text
 
     soup = BeautifulSoup(html, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
 
     data_sources = []
     nd = extract_next_data(html)
-    if nd:
-        data_sources.append(nd)
+    if nd: data_sources.append(nd)
 
     for blob in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.S | re.I):
-        try:
-            data_sources.append(json.loads(blob))
-        except Exception:
-            pass
+        try: data_sources.append(json.loads(blob))
+        except: pass
 
     exercises = []
     duration_minutes = None
@@ -408,7 +369,6 @@ def parse_hevy_share(url: str) -> dict:
 
     for root in data_sources:
         for node in walk_obj(root):
-            # --- exercises ---
             ex = node.get("exercises") or node.get("workoutExercises") or node.get("setsByExercise")
             if isinstance(ex, list) and ex:
                 for e in ex:
@@ -422,38 +382,32 @@ def parse_hevy_share(url: str) -> dict:
                         parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            # --- duration: only accept duration/elapsed-ish keys (avoid timestamps like startTime) ---
+            # scan broadly for any duration/time/elapsed key
             if duration_minutes is None and isinstance(node, dict):
                 for k, v in node.items():
                     kl = str(k).lower()
-                    if ("duration" in kl) or ("elapsed" in kl) or (kl in ("workoutduration", "durationminutes", "durationsecs", "durationseconds")):
+                    if any(key in kl for key in ("duration", "time", "elapsed")):
                         mins = parse_duration_minutes(v, key_hint=kl)
-                        if mins is not None and 1 <= mins <= 600:
+                        if mins is not None and 0 < mins < 600:  # sanity: ignore absurd values
                             duration_minutes = mins
                             break
 
-            # --- date/time (unchanged) ---
             if not wdate:
                 wdate = node.get("date") or node.get("startTime") or node.get("startDate") or node.get("workoutDate")
 
-    # Fallback: parse from visible text like "1 h 23 min" or "83 min"
-    if duration_minutes is None:
-        mins = duration_from_text(page_text)
-        if mins is not None and 1 <= mins <= 600:
-            duration_minutes = mins
-
-    # Fallback: look for ISO-8601 duration string if still missing
     if duration_minutes is None:
         html_lower = html.lower()
         m = re.search(r"pt(?:\d+h)?(?:\d+m)?(?:\d+s)?", html_lower)
         if m:
-            mins = parse_duration_minutes(m.group(0))
-            if mins is not None and 1 <= mins <= 600:
-                duration_minutes = mins
-
-    # Final plausibility cap
-    if duration_minutes is not None and not (1 <= duration_minutes <= 600):
-        duration_minutes = None
+            guess = parse_duration_minutes(m.group(0))
+            if guess and 0 < guess < 600:
+                duration_minutes = guess
+    if duration_minutes is None:
+        m = re.search(r"(\d+)\s*h(?:\s*(\d+)\s*m)?", html_lower) or re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?\b", html_lower)
+        if m:
+            guess = parse_duration_minutes(m.group(0))
+            if guess and 0 < guess < 600:
+                duration_minutes = guess
 
     total_volume = 0
     for e in exercises:
@@ -465,7 +419,7 @@ def parse_hevy_share(url: str) -> dict:
         try:
             parsed_date = datetime.strptime(str(wdate)[:len(fmt)], fmt).date()
             break
-        except Exception:
+        except:
             continue
 
     return {
@@ -490,28 +444,31 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
         nutrition_api_key=body.nutrition_api_key,
     )
 
+@app.post("/users/goal")
+def set_goal(body: GoalIn, db: Session = Depends(get_db)):
+    u = get_or_create_user(db, name=body.user_name)
+    u.goal_weight_kg = Decimal(str(body.goal_weight_kg))
+    u.goal_date = body.goal_date
+    db.commit(); db.refresh(u)
+    return {"ok": True, "user": u.name, "goal_weight_kg": float(u.goal_weight_kg), "goal_date": u.goal_date.isoformat()}
+
 @app.get("/users", response_model=list[UserOut])
 def list_users(db: Session = Depends(get_db)):
     return db.query(User).all()
 
 @app.post("/ingest/hevy", response_model=HevyWorkoutOut)
 def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
-    # 1) ensure user exists
     user = get_or_create_user(db, name=body.user_name)
-
-    # 2) parse the share page
     try:
         parsed = parse_hevy_share(body.url)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Hevy fetch/parse failed: {type(e).__name__}: {e}")
 
-    # 3) JSON-safe 'raw'
     safe_raw = jsonable_encoder(parsed, custom_encoder={
         date: lambda v: v.isoformat(),
         datetime: lambda v: v.isoformat(),
     })
 
-    # 4) UPSERT: if (user, url) exists -> update; else insert
     existing = db.query(HevyWorkout).filter(
         HevyWorkout.user_id == user.id,
         HevyWorkout.source_url == body.url
@@ -522,8 +479,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
         existing.duration_minutes = parsed.get("duration_minutes")
         existing.total_volume = parsed.get("total_volume")
         existing.raw = safe_raw
-        db.commit()
-        db.refresh(existing)
+        db.commit(); db.refresh(existing)
         w = existing
     else:
         try:
@@ -535,11 +491,8 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
                 source_url=body.url,
                 raw=safe_raw,
             )
-            db.add(w)
-            db.commit()
-            db.refresh(w)
+            db.add(w); db.commit(); db.refresh(w)
         except IntegrityError:
-            # extremely rare race: re-fetch row and update
             db.rollback()
             existing = db.query(HevyWorkout).filter(
                 HevyWorkout.user_id == user.id,
@@ -551,8 +504,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
             existing.duration_minutes = parsed.get("duration_minutes")
             existing.total_volume = parsed.get("total_volume")
             existing.raw = safe_raw
-            db.commit()
-            db.refresh(existing)
+            db.commit(); db.refresh(existing)
             w = existing
 
     return HevyWorkoutOut(
@@ -591,6 +543,25 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
         n += 1
     return {"ok": True, "rows": n}
 
+@app.post("/ingest/weight/manual")
+def ingest_weight_manual(body: WeightManualIn, db: Session = Depends(get_db)):
+    user = get_or_create_user(db, name=body.user_name)
+    upsert_weight(db, user_id=user.id, dt=body.date, weight_kg=body.weight_kg, source="manual")
+    return {"ok": True}
+
+@app.post("/ingest/weight/csv")
+def ingest_weight_csv(user_name: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    user = get_or_create_user(db, name=user_name)
+    content = file.file.read().decode("utf-8")
+    reader = csv.DictReader(io.StringIO(content))
+    n = 0
+    for row in reader:
+        dt = date.fromisoformat(row["date"])
+        wkg = float(row["weight_kg"])
+        upsert_weight(db, user_id=user.id, dt=dt, weight_kg=wkg, source="csv")
+        n += 1
+    return {"ok": True, "rows": n}
+
 # --- debug: recent workouts
 @app.get("/debug/workouts")
 def debug_workouts(user_name: Optional[str] = None, limit: int = 10, db: Session = Depends(get_db)):
@@ -626,6 +597,57 @@ def debug_nutrition(user_name: Optional[str] = None, limit: int = 20, db: Sessio
         {"user": u.name, "date": n.date.isoformat(), "protein_g": n.protein_g}
         for (n, u) in rows
     ]
+
+# --- debug: weight rows
+@app.get("/debug/weight")
+def debug_weight(user_name: Optional[str] = None, limit: int = 30, db: Session = Depends(get_db)):
+    q = db.query(WeightLog, User).join(User, WeightLog.user_id == User.id)
+    if user_name:
+        q = q.filter(User.name == user_name)
+    rows = q.order_by(WeightLog.date.desc()).limit(limit).all()
+    return [
+        {"user": u.name, "date": w.date.isoformat(), "weight_kg": float(w.weight_kg)}
+        for (w, u) in rows
+    ]
+
+# --- debug: pace calc (simple)
+@app.get("/debug/pace")
+def debug_pace(user_name: str, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.name == user_name).first()
+    if not u:
+        raise HTTPException(404, "user not found")
+    if not u.goal_date or not u.goal_weight_kg:
+        raise HTTPException(400, "set goal first via POST /users/goal")
+
+    # first and last weight
+    first = db.query(WeightLog).filter(WeightLog.user_id==u.id).order_by(WeightLog.date.asc()).first()
+    last  = db.query(WeightLog).filter(WeightLog.user_id==u.id).order_by(WeightLog.date.desc()).first()
+    if not first or not last:
+        raise HTTPException(400, "no weight logs")
+
+    start_w, start_d = float(first.weight_kg), first.date
+    last_w, last_d   = float(last.weight_kg), last.date
+    goal_w, goal_d   = float(u.goal_weight_kg), u.goal_date
+
+    total_days = max(1, (goal_d - start_d).days)
+    elapsed = (last_d - start_d).days
+    progress_ratio = (last_w - start_w) / (goal_w - start_w) if (goal_w - start_w) != 0 else 0.0
+    scheduled_days_by_now = progress_ratio * total_days
+    days_ahead = round(scheduled_days_by_now - elapsed, 1)
+
+    # scheduled weight for today
+    today = date.today()
+    t_elapsed = max(0, min(total_days, (today - start_d).days))
+    scheduled_today = start_w + (t_elapsed / total_days) * (goal_w - start_w)
+
+    return {
+        "user": u.name,
+        "start": {"date": start_d.isoformat(), "weight_kg": start_w},
+        "latest": {"date": last_d.isoformat(), "weight_kg": last_w},
+        "goal": {"date": goal_d.isoformat(), "weight_kg": goal_w},
+        "scheduled_today": round(scheduled_today, 2),
+        "days_ahead": days_ahead
+    }
 
 # --- debug: raw fetch tester
 @app.get("/debug/fetch")
@@ -684,7 +706,7 @@ def home():
 
     <main class="container">
       <h2>Log your stuff, win the week 💪</h2>
-      <p class="muted">Paste your Hevy share link or log today’s protein. It’s quick.</p>
+      <p class="muted">Paste your Hevy share link, log your bodyweight, or today’s protein.</p>
 
       <div class="grid">
         <section class="card">
@@ -702,6 +724,22 @@ def home():
         </section>
 
         <section class="card">
+          <h3>Log bodyweight</h3>
+          <form id="weightForm">
+            <label for="wUser">Who are you?</label>
+            <select id="wUser" required></select>
+
+            <label for="wDate">Date</label>
+            <input id="wDate" type="date" required />
+
+            <label for="wKg">Weight (kg)</label>
+            <input id="wKg" type="number" min="20" max="400" step="0.1" placeholder="e.g. 82.4" required />
+
+            <button type="submit">Save weight</button>
+          </form>
+        </section>
+
+        <section class="card">
           <h3>Log protein for today</h3>
           <form id="protForm">
             <label for="protUser">Who are you?</label>
@@ -714,7 +752,7 @@ def home():
             <input id="protG" type="number" min="0" step="1" placeholder="e.g. 180" required />
 
             <button type="submit">Save protein</button>
-            <small class="muted">You can upload CSVs in the API docs later.</small>
+            <small class="muted">Bulk import CSVs in <a href="/docs" target="_blank">API docs</a>.</small>
           </form>
         </section>
       </div>
@@ -742,7 +780,7 @@ def home():
       try {
         const res = await fetch(API + '/users');
         const users = await res.json();
-        for (const id of ['hevyUser','protUser']) {
+        for (const id of ['hevyUser','protUser','wUser']) {
           const sel = document.getElementById(id);
           sel.innerHTML = '';
           users.forEach(u => {
@@ -754,8 +792,9 @@ def home():
       } catch (e) { showToast('Could not load users', true); }
     }
 
-    // Link your Grafana board here (optional)
-    document.getElementById('grafanaHref').href = 'http://100.89.255.16:3030/d/f2da7bd4-0c35-48d5-9185-e31f546d709d/fitness-goal-tracker?orgId=1&var-user=All&kiosk';
+    // Set your Grafana link (replace with your real /d/<UID>/<slug>)
+    document.getElementById('grafanaHref').href =
+      'http://100.89.255.16:3030/d/f2da7bd4-0c35-48d5-9185-e31f546d709d/fitness-goal-tracker?orgId=1&var-user=All&from=now-30d&to=now&kiosk';
     document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
     document.getElementById('dashLink').setAttribute('target','_blank');
 
@@ -776,6 +815,23 @@ def home():
       } catch(err){ showToast('Submit failed', true); }
     });
 
+    // Weight submit
+    document.getElementById('weightForm').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const user = document.getElementById('wUser').value;
+      const d = document.getElementById('wDate').value;
+      const w = parseFloat(document.getElementById('wKg').value);
+      try {
+        const res = await fetch(API + '/ingest/weight/manual', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({user_name: user, date: d, weight_kg: w})
+        });
+        if (!res.ok) throw new Error(await res.text());
+        showToast('Weight saved!');
+        document.getElementById('wKg').value = '';
+      } catch(err){ showToast('Save failed', true); }
+    });
+
     // Protein submit
     document.getElementById('protForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
@@ -793,8 +849,8 @@ def home():
       } catch(err){ showToast('Save failed', true); }
     });
 
-    // Defaults
     document.getElementById('protDate').valueAsDate = new Date();
+    document.getElementById('wDate').valueAsDate = new Date();
     loadUsers();
     </script>
   </body>
