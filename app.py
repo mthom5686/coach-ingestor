@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 import os, io, csv, json, re
 import httpx
 from bs4 import BeautifulSoup
@@ -95,7 +94,7 @@ class NutritionManualIn(BaseModel):
     fat_g: Optional[int] = None
 
 # ----- FastAPI -----
-app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.0")
+app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.1")
 
 def get_db():
     db = SessionLocal()
@@ -125,77 +124,128 @@ def upsert_nutrition(db: Session, user_id: int, dt: date, protein_g: int|None, c
     log.protein_g, log.calories, log.carbs_g, log.fat_g, log.source = protein_g, calories, carbs_g, fat_g, source
     db.commit(); db.refresh(log); return log
 
-# ----- Hevy parser (heuristic) -----
-UA = {"User-Agent": "Mozilla/5.0 (CoachIngestor/1.0)"}
+# ----- HTTP fetch headers (more browser-like) -----
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 
-def extract_json_blobs(html: str):
-    blobs = []
-    m = re.search(r'__NEXT_DATA__"\s*type="application/json">(.+?)</script>', html)
-    if m:
-        try: blobs.append(json.loads(m.group(1)))
-        except: pass
-    for blob in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, flags=re.S):
-        try: blobs.append(json.loads(blob))
-        except: pass
-    m3 = re.search(r'"exercises"\s*:\s*(\[[\s\S]*?\])', html)
-    if m3:
-        try: blobs.append({"exercises": json.loads(m3.group(1))})
-        except: pass
-    return blobs
+# ----- Hevy parser (robust) -----
+def extract_next_data(html: str) -> dict | None:
+    """
+    Grab Next.js data regardless of attribute order/quotes:
+    <script id="__NEXT_DATA__" type="application/json">…</script>
+    """
+    m = re.search(r'<script[^>]+id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', html, re.S | re.I)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return None
 
-def walk(obj, key_pred):
+def walk_obj(obj):
     if isinstance(obj, dict):
-        if key_pred(obj.keys()): yield obj
-        for v in obj.values(): yield from walk(v, key_pred)
+        yield obj
+        for v in obj.values():
+            yield from walk_obj(v)
     elif isinstance(obj, list):
-        for it in obj: yield from walk(it, key_pred)
+        for it in obj:
+            yield from walk_obj(it)
 
 def parse_hevy_share(url: str) -> dict:
-    with httpx.Client(timeout=20.0, headers=UA, follow_redirects=True) as client:
-        r = client.get(url); r.raise_for_status(); html = r.text
-    soup = BeautifulSoup(html, "lxml")
-    collected = extract_json_blobs(html)
+    # Accept both hevy.com and hevy.app links
+    with httpx.Client(timeout=25.0, headers=HTTP_HEADERS, follow_redirects=True) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        html = r.text
 
-    exercises, duration_minutes, wdate = [], None, None
-    for blob in collected:
-        for n in walk(blob, lambda k: "exercises" in k):
-            ex = n.get("exercises"); 
+    soup = BeautifulSoup(html, "html.parser")
+
+    data_sources = []
+    nd = extract_next_data(html)
+    if nd: data_sources.append(nd)
+
+    # also collect any JSON-LD blocks as a fallback
+    for blob in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.S | re.I):
+        try:
+            data_sources.append(json.loads(blob))
+        except Exception:
+            pass
+
+    exercises = []
+    duration_minutes = None
+    wdate = None
+
+    # Explore all nested objects for common Hevy fields
+    for root in data_sources:
+        for node in walk_obj(root):
+            # exercises
+            ex = node.get("exercises") or node.get("workoutExercises") or node.get("setsByExercise")
             if isinstance(ex, list) and ex:
                 for e in ex:
                     name = e.get("name") or e.get("exerciseName") or "Unknown"
-                    sets, raw_sets = [], (e.get("sets") or e.get("workoutSets") or [])
+                    raw_sets = e.get("sets") or e.get("workoutSets") or []
+                    parsed_sets = []
                     for s in raw_sets:
-                        reps = s.get("reps") or s.get("repetitions") or s.get("r", 0)
-                        weight = s.get("weight") or s.get("w", 0)
-                        if isinstance(weight, dict): weight = weight.get("kg") or weight.get("val") or 0
-                        sets.append({"reps": int(reps or 0), "weight": float(weight or 0)})
-                    exercises.append({"name": name, "sets": sets})
-        for n in walk(blob, lambda k: "duration" in k or "durationMinutes" in k):
-            duration_minutes = duration_minutes or n.get("duration") or n.get("durationMinutes")
-        for n in walk(blob, lambda k: "date" in k or "startTime" in k or "start_date" in k):
-            wdate = wdate or n.get("date") or n.get("startTime") or n.get("start_date")
+                        reps = s.get("reps") or s.get("repetitions") or s.get("r") or 0
+                        weight = s.get("weight") or s.get("w") or 0
+                        if isinstance(weight, dict):
+                            weight = weight.get("kg") or weight.get("val") or 0
+                        parsed_sets.append({"reps": int(reps or 0), "weight": float(weight or 0)})
+                    exercises.append({"name": name, "sets": parsed_sets})
 
+            # duration (prefer minutes; convert seconds if found)
+            if duration_minutes is None:
+                if "durationMinutes" in node:
+                    duration_minutes = int(node.get("durationMinutes") or 0)
+                elif "workoutDuration" in node:
+                    duration_minutes = int(node.get("workoutDuration") or 0)
+                elif "durationSec" in node:
+                    try:
+                        duration_minutes = int(round((node.get("durationSec") or 0) / 60))
+                    except Exception:
+                        pass
+                elif "duration" in node and isinstance(node.get("duration"), (int, float)):
+                    duration_minutes = int(node.get("duration"))
+
+            # date/time
+            if not wdate:
+                wdate = node.get("date") or node.get("startTime") or node.get("startDate") or node.get("workoutDate")
+
+    # Meta fallbacks
     if not wdate:
         meta_date = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("time")
-        if meta_date: wdate = meta_date.get("content") or meta_date.get_text(strip=True)
+        if meta_date:
+            wdate = meta_date.get("content") or meta_date.get_text(strip=True)
 
+    # Calculate total volume
     total_volume = 0
     for e in exercises:
         for s in e["sets"]:
             total_volume += int((s.get("weight") or 0) * (s.get("reps") or 0))
 
+    # Parse date (best-effort)
     parsed_date = None
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
         try:
-            parsed_date = datetime.strptime(str(wdate)[:len(fmt)], fmt).date(); break
-        except: continue
+            parsed_date = datetime.strptime(str(wdate)[:len(fmt)], fmt).date()
+            break
+        except Exception:
+            continue
 
     return {
         "date": parsed_date or datetime.utcnow().date(),
         "duration_minutes": int(duration_minutes) if duration_minutes is not None else None,
         "total_volume": int(total_volume),
         "exercises": exercises,
-        "raw_hint": "Parsed heuristically from Hevy share page"
+        "raw_hint": "Parsed from Hevy share",
     }
 
 # ----- Routes -----
@@ -214,7 +264,11 @@ def list_users(db: Session = Depends(get_db)):
 @app.post("/ingest/hevy", response_model=HevyWorkoutOut)
 def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
     user = get_or_create_user(db, name=body.user_name)
-    parsed = parse_hevy_share(body.url)
+    try:
+        parsed = parse_hevy_share(body.url)
+    except Exception as e:
+        # Return a readable error to the client (so the UI toast shows it)
+        raise HTTPException(status_code=502, detail=f"Hevy fetch/parse failed: {type(e).__name__}: {e}")
     w = create_workout(db, user_id=user.id, dt=parsed["date"],
                        duration=parsed.get("duration_minutes"),
                        volume=parsed.get("total_volume"),
@@ -248,6 +302,33 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
         n += 1
     return {"ok": True, "rows": n}
 
+# --- tiny debug endpoints ---
+@app.get("/debug/hevy")
+def debug_hevy(url: str):
+    try:
+        parsed = parse_hevy_share(url)
+        return {
+            "ok": True,
+            "date": parsed.get("date"),
+            "duration_minutes": parsed.get("duration_minutes"),
+            "total_volume": parsed.get("total_volume"),
+            "exercise_count": len(parsed.get("exercises") or []),
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+@app.get("/debug/nutrition")
+def debug_nutrition(user_name: Optional[str] = None, limit: int = 20, db: Session = Depends(get_db)):
+    q = db.query(NutritionLog, User).join(User, NutritionLog.user_id == User.id)
+    if user_name:
+        q = q.filter(User.name == user_name)
+    rows = q.order_by(NutritionLog.id.desc()).limit(limit).all()
+    return [
+        {"user": u.name, "date": n.date.isoformat(), "protein_g": n.protein_g}
+        for (n, u) in rows
+    ]
+
+# --- Simple homepage (unchanged) ---
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -257,7 +338,6 @@ def home():
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>LiftCrew – Submit</title>
-    <!-- Clean, modern styling with zero build step -->
     <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2/css/pico.min.css">
     <style>
       .container { max-width: 880px; margin: 2rem auto; }
@@ -291,7 +371,6 @@ def home():
       <p class="muted">Paste your Hevy share link or log today’s protein. It’s quick.</p>
 
       <div class="grid">
-        <!-- Hevy submit -->
         <section class="card">
           <h3>Share a Hevy workout</h3>
           <form id="hevyForm">
@@ -306,7 +385,6 @@ def home():
           </form>
         </section>
 
-        <!-- Protein log -->
         <section class="card">
           <h3>Log protein for today</h3>
           <form id="protForm">
@@ -329,13 +407,6 @@ def home():
         <h3>Team dashboard</h3>
         <p class="muted">Open the shared Grafana board:</p>
         <a id="grafanaHref" class="secondary" target="_blank" href="#">Open Grafana</a>
-        <!-- Want to embed? Replace the href + uncomment the iframe below -->
-        <!--
-        <div style="margin-top:1rem;">
-          <iframe src="https://YOUR-GRAFANA-HOST/d/ABC123/your-board?orgId=1&kiosk"
-                  width="100%" height="720" frameborder="0"></iframe>
-        </div>
-        -->
       </section>
 
       <footer>
@@ -344,7 +415,7 @@ def home():
     </main>
 
     <script>
-    const API = window.location.origin; // same host/port
+    const API = window.location.origin;
     const toast = document.getElementById('toast');
     function showToast(msg, isErr=false){
       toast.textContent = msg; toast.className = 'toast' + (isErr?' error':'');
@@ -367,8 +438,10 @@ def home():
       } catch (e) { showToast('Could not load users', true); }
     }
 
-    // If you have a Grafana URL, set it here for the button
-    document.getElementById('grafanaHref').href = 'https://YOUR-GRAFANA-HOST/d/ABC123/your-board';
+    // Set your Grafana URL here:
+    document.getElementById('grafanaHref').href = 'http://<YOUR-SERVER>:3030/d/<UID>/<slug>?orgId=1&var-user=All&kiosk';
+    document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
+    document.getElementById('dashLink').setAttribute('target','_blank');
 
     // Hevy submit
     document.getElementById('hevyForm').addEventListener('submit', async (e)=>{
@@ -404,7 +477,6 @@ def home():
       } catch(err){ showToast('Save failed', true); }
     });
 
-    // Defaults: set date to today; load users
     document.getElementById('protDate').valueAsDate = new Date();
     loadUsers();
     </script>
