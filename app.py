@@ -159,6 +159,51 @@ def walk_obj(obj):
         for it in obj:
             yield from walk_obj(it)
 
+def _num_from_any(x):
+    """Return float from int/float/str/dict; pulls the first number found in strings."""
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, dict):
+        # common shapes: {"kg":80}, {"value":80,"unit":"kg"}, {"val":80}
+        for k in ("kg", "value", "val", "amount", "weight"):
+            if k in x:
+                return _num_from_any(x[k])
+        return None
+    if isinstance(x, str):
+        m = re.search(r'[-+]?\d*\.?\d+', x)
+        return float(m.group(0)) if m else None
+    return None
+
+def _weight_kg_from_set(s: dict):
+    """
+    Try many keys for weight; detect unit; convert lbs->kg.
+    Returns float kilograms or 0.0 if unknown.
+    """
+    candidates = [
+        s.get("weight"), s.get("w"), s.get("weightKg"), s.get("weight_kg"),
+        s.get("kg"), s.get("weightValue"), s.get("value"), s.get("mass"),
+        s.get("load"), s.get("weightLbs"), s.get("lbs"), s.get("lb"),
+    ]
+    unit = (s.get("unit") or s.get("weightUnit") or s.get("u") or "").lower()
+
+    # pick the first non-empty candidate
+    raw = next((c for c in candidates if c not in (None, "")), None)
+    val = _num_from_any(raw)
+
+    # Infer unit from field names/strings if not given
+    txt = str(raw).lower()
+    looks_lb = ("weightlbs" in s or "lbs" in txt or " lb" in txt or unit in ("lb", "lbs", "pounds"))
+    looks_kg = ("kg" in txt) or ("weightkg" in s) or (unit in ("kg", "kilogram", "kilograms"))
+
+    if val is None:
+        return 0.0
+
+    if looks_lb and not looks_kg:
+        return round(val * 0.45359237, 3)  # convert to kg
+    return float(val)  # assume kg (Hevy defaults to kg in many shares)
+
 def parse_hevy_share(url: str) -> dict:
     # Accept both hevy.com and hevy.app links
     with httpx.Client(timeout=25.0, headers=HTTP_HEADERS, follow_redirects=True) as client:
@@ -168,11 +213,13 @@ def parse_hevy_share(url: str) -> dict:
 
     soup = BeautifulSoup(html, "html.parser")
 
+    # Grab Next.js state if present
     data_sources = []
     nd = extract_next_data(html)
-    if nd: data_sources.append(nd)
+    if nd:
+        data_sources.append(nd)
 
-    # also collect any JSON-LD blocks as a fallback
+    # Also collect any JSON-LD blocks as a fallback
     for blob in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.S | re.I):
         try:
             data_sources.append(json.loads(blob))
@@ -183,10 +230,10 @@ def parse_hevy_share(url: str) -> dict:
     duration_minutes = None
     wdate = None
 
-    # Explore all nested objects for common Hevy fields
+    # Walk all nested nodes for common Hevy fields
     for root in data_sources:
         for node in walk_obj(root):
-            # exercises
+            # exercises list
             ex = node.get("exercises") or node.get("workoutExercises") or node.get("setsByExercise")
             if isinstance(ex, list) and ex:
                 for e in ex:
@@ -195,25 +242,23 @@ def parse_hevy_share(url: str) -> dict:
                     parsed_sets = []
                     for s in raw_sets:
                         reps = s.get("reps") or s.get("repetitions") or s.get("r") or 0
-                        weight = s.get("weight") or s.get("w") or 0
-                        if isinstance(weight, dict):
-                            weight = weight.get("kg") or weight.get("val") or 0
-                        parsed_sets.append({"reps": int(reps or 0), "weight": float(weight or 0)})
+                        reps = int(_num_from_any(reps) or 0)
+                        wkg = _weight_kg_from_set(s)
+                        parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            # duration (prefer minutes; convert seconds if found)
+            # duration
             if duration_minutes is None:
                 if "durationMinutes" in node:
-                    duration_minutes = int(node.get("durationMinutes") or 0)
+                    duration_minutes = int(_num_from_any(node.get("durationMinutes")) or 0)
                 elif "workoutDuration" in node:
-                    duration_minutes = int(node.get("workoutDuration") or 0)
-                elif "durationSec" in node:
-                    try:
-                        duration_minutes = int(round((node.get("durationSec") or 0) / 60))
-                    except Exception:
-                        pass
-                elif "duration" in node and isinstance(node.get("duration"), (int, float)):
-                    duration_minutes = int(node.get("duration"))
+                    duration_minutes = int(_num_from_any(node.get("workoutDuration")) or 0)
+                elif "durationSec" in node or "durationSeconds" in node:
+                    secs = _num_from_any(node.get("durationSec") or node.get("durationSeconds"))
+                    if secs is not None:
+                        duration_minutes = int(round(secs / 60))
+                elif "duration" in node and isinstance(node.get("duration"), (int, float, str, dict)):
+                    duration_minutes = int(_num_from_any(node.get("duration")) or 0)
 
             # date/time
             if not wdate:
@@ -225,13 +270,13 @@ def parse_hevy_share(url: str) -> dict:
         if meta_date:
             wdate = meta_date.get("content") or meta_date.get_text(strip=True)
 
-    # Calculate total volume
+    # Compute total volume (kg * reps)
     total_volume = 0
     for e in exercises:
         for s in e["sets"]:
-            total_volume += int((s.get("weight") or 0) * (s.get("reps") or 0))
+            total_volume += int(round((s.get("weight_kg") or 0) * (s.get("reps") or 0)))
 
-    # Parse date (best-effort)
+    # Parse ISO/local-ish dates
     parsed_date = None
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
         try:
@@ -245,7 +290,7 @@ def parse_hevy_share(url: str) -> dict:
         "duration_minutes": int(duration_minutes) if duration_minutes is not None else None,
         "total_volume": int(total_volume),
         "exercises": exercises,
-        "raw_hint": "Parsed from Hevy share",
+        "raw_hint": "Parsed from Hevy share (weights normalized to kg)",
     }
 
 # ----- Routes -----
