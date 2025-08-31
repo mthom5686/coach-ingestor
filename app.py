@@ -755,7 +755,7 @@ def home():
     }
 
     // Link your Grafana board here (optional)
-    document.getElementById('grafanaHref').href = 'http://<YOUR-SERVER>:3030/d/<UID>/<slug>?orgId=1&var-user=All&kiosk';
+    document.getElementById('grafanaHref').href = 'http://100.89.255.16:3030/d/f2da7bd4-0c35-48d5-9185-e31f546d709d/fitness-goal-tracker?orgId=1&var-user=All&kiosk';
     document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
     document.getElementById('dashLink').setAttribute('target','_blank');
 
