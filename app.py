@@ -311,25 +311,67 @@ def list_users(db: Session = Depends(get_db)):
 
 @app.post("/ingest/hevy", response_model=HevyWorkoutOut)
 def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
+    # 1) ensure user exists
     user = get_or_create_user(db, name=body.user_name)
+
+    # 2) parse the share page
     try:
         parsed = parse_hevy_share(body.url)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Hevy fetch/parse failed: {type(e).__name__}: {e}")
-    try:
-        w = create_workout(db, user_id=user.id, dt=parsed["date"],
-                           duration=parsed.get("duration_minutes"),
-                           volume=parsed.get("total_volume"),
-                           url=body.url, raw=parsed)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="Workout already exists for this user/link")
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}: {e}")
-    return HevyWorkoutOut(user_name=user.name, date=w.date,
-                          duration_minutes=w.duration_minutes,
-                          total_volume=w.total_volume)
+
+    # 3) JSON-safe 'raw'
+    safe_raw = jsonable_encoder(parsed, custom_encoder={
+        date: lambda v: v.isoformat(),
+        datetime: lambda v: v.isoformat(),
+    })
+
+    # 4) UPSERT: if (user, url) exists -> update; else insert
+    existing = db.query(HevyWorkout).filter(
+        HevyWorkout.user_id == user.id,
+        HevyWorkout.source_url == body.url
+    ).first()
+
+    if existing:
+        existing.date = parsed["date"]
+        existing.duration_minutes = parsed.get("duration_minutes")
+        existing.total_volume = parsed.get("total_volume")
+        existing.raw = safe_raw
+        db.commit(); db.refresh(existing)
+        w = existing
+    else:
+        try:
+            w = HevyWorkout(
+                user_id=user.id,
+                date=parsed["date"],
+                duration_minutes=parsed.get("duration_minutes"),
+                total_volume=parsed.get("total_volume"),
+                source_url=body.url,
+                raw=safe_raw,
+            )
+            db.add(w); db.commit(); db.refresh(w)
+        except IntegrityError:
+            # extremely rare race: re-fetch row and update
+            db.rollback()
+            existing = db.query(HevyWorkout).filter(
+                HevyWorkout.user_id == user.id,
+                HevyWorkout.source_url == body.url
+            ).first()
+            if not existing:
+                raise HTTPException(status_code=409, detail="Workout exists and could not be updated")
+            existing.date = parsed["date"]
+            existing.duration_minutes = parsed.get("duration_minutes")
+            existing.total_volume = parsed.get("total_volume")
+            existing.raw = safe_raw
+            db.commit(); db.refresh(existing)
+            w = existing
+
+    return HevyWorkoutOut(
+        user_name=user.name,
+        date=w.date,
+        duration_minutes=w.duration_minutes,
+        total_volume=w.total_volume,
+    )
 
 @app.post("/ingest/nutrition/manual")
 def ingest_nutrition_manual(body: NutritionManualIn, db: Session = Depends(get_db)):
