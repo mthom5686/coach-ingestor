@@ -3,6 +3,8 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
 from fastapi.responses import HTMLResponse
+from fastapi.encoders import jsonable_encoder
+from datetime import date, datetime
 import os, io, csv, json, re
 import httpx
 from bs4 import BeautifulSoup
@@ -115,8 +117,28 @@ def get_or_create_user(db: Session, name: str, **kwargs) -> User:
     u = User(name=name, **kwargs); db.add(u); db.commit(); db.refresh(u); return u
 
 def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volume: int|None, url: str, raw: dict|None):
-    w = HevyWorkout(user_id=user_id, date=dt, duration_minutes=duration, total_volume=volume, source_url=url, raw=raw)
-    db.add(w); db.commit(); db.refresh(w); return w
+    safe_raw = None
+    if raw is not None:
+        # Convert date/datetime (and any other non-JSON types) to strings
+        safe_raw = jsonable_encoder(
+            raw,
+            custom_encoder={
+                date: lambda v: v.isoformat(),
+                datetime: lambda v: v.isoformat(),
+            },
+        )
+    w = HevyWorkout(
+        user_id=user_id,
+        date=dt,
+        duration_minutes=duration,
+        total_volume=volume,
+        source_url=url,
+        raw=safe_raw,
+    )
+    db.add(w)
+    db.commit()
+    db.refresh(w)
+    return w
 
 def upsert_nutrition(db: Session, user_id: int, dt: date, protein_g: int|None, calories: int|None, carbs_g: int|None, fat_g: int|None, source: str="api"):
     log = db.query(NutritionLog).filter(NutritionLog.user_id==user_id, NutritionLog.date==dt).first()
