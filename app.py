@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, JSON, UniqueConstraint, BigInteger
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+from sqlalchemy.exc import IntegrityError
 
 # ----- DB setup -----
 DB_HOST = os.getenv("DB_HOST", "coachdb")
@@ -94,7 +95,7 @@ class NutritionManualIn(BaseModel):
     fat_g: Optional[int] = None
 
 # ----- FastAPI -----
-app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.1")
+app = FastAPI(title="Coach Ingestor API (single-file)", version="0.1.2")
 
 def get_db():
     db = SessionLocal()
@@ -138,10 +139,6 @@ HTTP_HEADERS = {
 
 # ----- Hevy parser (robust) -----
 def extract_next_data(html: str) -> dict | None:
-    """
-    Grab Next.js data regardless of attribute order/quotes:
-    <script id="__NEXT_DATA__" type="application/json">…</script>
-    """
     m = re.search(r'<script[^>]+id=[\'"]__NEXT_DATA__[\'"][^>]*>(.*?)</script>', html, re.S | re.I)
     if not m:
         return None
@@ -160,13 +157,11 @@ def walk_obj(obj):
             yield from walk_obj(it)
 
 def _num_from_any(x):
-    """Return float from int/float/str/dict; pulls the first number found in strings."""
     if x is None:
         return None
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, dict):
-        # common shapes: {"kg":80}, {"value":80,"unit":"kg"}, {"val":80}
         for k in ("kg", "value", "val", "amount", "weight"):
             if k in x:
                 return _num_from_any(x[k])
@@ -177,49 +172,42 @@ def _num_from_any(x):
     return None
 
 def _weight_kg_from_set(s: dict):
-    """
-    Try many keys for weight; detect unit; convert lbs->kg.
-    Returns float kilograms or 0.0 if unknown.
-    """
     candidates = [
         s.get("weight"), s.get("w"), s.get("weightKg"), s.get("weight_kg"),
         s.get("kg"), s.get("weightValue"), s.get("value"), s.get("mass"),
         s.get("load"), s.get("weightLbs"), s.get("lbs"), s.get("lb"),
     ]
     unit = (s.get("unit") or s.get("weightUnit") or s.get("u") or "").lower()
-
-    # pick the first non-empty candidate
     raw = next((c for c in candidates if c not in (None, "")), None)
     val = _num_from_any(raw)
-
-    # Infer unit from field names/strings if not given
     txt = str(raw).lower()
     looks_lb = ("weightlbs" in s or "lbs" in txt or " lb" in txt or unit in ("lb", "lbs", "pounds"))
     looks_kg = ("kg" in txt) or ("weightkg" in s) or (unit in ("kg", "kilogram", "kilograms"))
-
     if val is None:
         return 0.0
-
     if looks_lb and not looks_kg:
-        return round(val * 0.45359237, 3)  # convert to kg
-    return float(val)  # assume kg (Hevy defaults to kg in many shares)
+        return round(val * 0.45359237, 3)
+    return float(val)
 
 def parse_hevy_share(url: str) -> dict:
-    # Accept both hevy.com and hevy.app links
-    with httpx.Client(timeout=25.0, headers=HTTP_HEADERS, follow_redirects=True) as client:
+    # Short timeouts + retries + Referer so we fail fast and get clearer errors
+    with httpx.Client(
+        timeout=httpx.Timeout(8.0, connect=5.0, read=8.0),
+        follow_redirects=True,
+        headers=HTTP_HEADERS | {"Referer": "https://hevy.com/"},
+        transport=httpx.HTTPTransport(retries=2),
+    ) as client:
         r = client.get(url)
         r.raise_for_status()
         html = r.text
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Grab Next.js state if present
     data_sources = []
     nd = extract_next_data(html)
     if nd:
         data_sources.append(nd)
 
-    # Also collect any JSON-LD blocks as a fallback
     for blob in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.S | re.I):
         try:
             data_sources.append(json.loads(blob))
@@ -230,10 +218,8 @@ def parse_hevy_share(url: str) -> dict:
     duration_minutes = None
     wdate = None
 
-    # Walk all nested nodes for common Hevy fields
     for root in data_sources:
         for node in walk_obj(root):
-            # exercises list
             ex = node.get("exercises") or node.get("workoutExercises") or node.get("setsByExercise")
             if isinstance(ex, list) and ex:
                 for e in ex:
@@ -247,7 +233,6 @@ def parse_hevy_share(url: str) -> dict:
                         parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            # duration
             if duration_minutes is None:
                 if "durationMinutes" in node:
                     duration_minutes = int(_num_from_any(node.get("durationMinutes")) or 0)
@@ -260,23 +245,19 @@ def parse_hevy_share(url: str) -> dict:
                 elif "duration" in node and isinstance(node.get("duration"), (int, float, str, dict)):
                     duration_minutes = int(_num_from_any(node.get("duration")) or 0)
 
-            # date/time
             if not wdate:
                 wdate = node.get("date") or node.get("startTime") or node.get("startDate") or node.get("workoutDate")
 
-    # Meta fallbacks
     if not wdate:
         meta_date = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("time")
         if meta_date:
             wdate = meta_date.get("content") or meta_date.get_text(strip=True)
 
-    # Compute total volume (kg * reps)
     total_volume = 0
     for e in exercises:
         for s in e["sets"]:
             total_volume += int(round((s.get("weight_kg") or 0) * (s.get("reps") or 0)))
 
-    # Parse ISO/local-ish dates
     parsed_date = None
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
         try:
@@ -312,12 +293,18 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
     try:
         parsed = parse_hevy_share(body.url)
     except Exception as e:
-        # Return a readable error to the client (so the UI toast shows it)
         raise HTTPException(status_code=502, detail=f"Hevy fetch/parse failed: {type(e).__name__}: {e}")
-    w = create_workout(db, user_id=user.id, dt=parsed["date"],
-                       duration=parsed.get("duration_minutes"),
-                       volume=parsed.get("total_volume"),
-                       url=body.url, raw=parsed)
+    try:
+        w = create_workout(db, user_id=user.id, dt=parsed["date"],
+                           duration=parsed.get("duration_minutes"),
+                           volume=parsed.get("total_volume"),
+                           url=body.url, raw=parsed)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Workout already exists for this user/link")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}: {e}")
     return HevyWorkoutOut(user_name=user.name, date=w.date,
                           duration_minutes=w.duration_minutes,
                           total_volume=w.total_volume)
@@ -373,7 +360,21 @@ def debug_nutrition(user_name: Optional[str] = None, limit: int = 20, db: Sessio
         for (n, u) in rows
     ]
 
-# --- Simple homepage (unchanged) ---
+@app.get("/debug/fetch")
+def debug_fetch(url: str):
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(8.0, connect=5.0, read=8.0),
+            follow_redirects=True,
+            headers=HTTP_HEADERS | {"Referer": "https://hevy.com/"},
+            transport=httpx.HTTPTransport(retries=2),
+        ) as client:
+            r = client.get(url)
+            return {"ok": True, "status": r.status_code, "final_url": str(r.url), "length": len(r.text)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+# --- Simple homepage (unchanged except version bump) ---
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -385,6 +386,8 @@ def home():
     <title>LiftCrew – Submit</title>
     <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2/css/pico.min.css">
     <style>
+      .container { max-width: 880px; margin: 2rem auto; }
+      <style>
       .container { max-width: 880px; margin: 2rem auto; }
       .card { padding: 1.25rem; border: 1px solid #e7e7e9; border-radius: 12px; }
       .grid { display: grid; gap: 1rem; grid-template-columns: 1fr; }
@@ -483,12 +486,10 @@ def home():
       } catch (e) { showToast('Could not load users', true); }
     }
 
-    // Set your Grafana URL here:
     document.getElementById('grafanaHref').href = 'http://<YOUR-SERVER>:3030/d/<UID>/<slug>?orgId=1&var-user=All&kiosk';
     document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
     document.getElementById('dashLink').setAttribute('target','_blank');
 
-    // Hevy submit
     document.getElementById('hevyForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const user = document.getElementById('hevyUser').value;
@@ -505,7 +506,6 @@ def home():
       } catch(err){ showToast('Submit failed', true); }
     });
 
-    // Protein submit
     document.getElementById('protForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const user = document.getElementById('protUser').value;
