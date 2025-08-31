@@ -245,6 +245,112 @@ def _weight_kg_from_set(s: dict):
         return round(val * 0.45359237, 3)
     return float(val)
 
+def parse_duration_minutes(val, key_hint: str = "") -> int | None:
+    """
+    Return duration in whole minutes from many possible shapes:
+    - int/float seconds or minutes (key_hint helps disambiguate)
+    - strings like 'PT1H23M', '1:23:45', '83 min', '1 h 23 m', '5000s'
+    - dicts like {'value': 4980, 'unit': 's'} or {'minutes': 83}
+    """
+    if val is None:
+        return None
+
+    # Dict forms
+    if isinstance(val, dict):
+        # direct minute/second fields
+        for kk in ("minutes", "mins", "min"):
+            if kk in val and val[kk] is not None:
+                try:
+                    return int(round(float(val[kk])))
+                except Exception:
+                    pass
+        for kk in ("seconds", "secs", "sec"):
+            if kk in val and val[kk] is not None:
+                try:
+                    return int(round(float(val[kk]) / 60.0))
+                except Exception:
+                    pass
+        # value + unit
+        unit = str(val.get("unit", "")).lower()
+        if "value" in val and val["value"] is not None:
+            try:
+                v = float(val["value"])
+                if unit in ("s", "sec", "secs", "second", "seconds"):
+                    return int(round(v / 60.0))
+                if unit in ("m", "min", "mins", "minute", "minutes"):
+                    return int(round(v))
+            except Exception:
+                pass
+        # generic numeric field
+        for kk in ("value", "val", "amount", "duration"):
+            if kk in val and val[kk] is not None:
+                return parse_duration_minutes(val[kk], key_hint)
+
+        # unknown dict
+        return None
+
+    # Numeric forms
+    if isinstance(val, (int, float)):
+        v = float(val)
+        kh = key_hint.lower()
+        if any(x in kh for x in ("sec", "second")):
+            return int(round(v / 60.0))
+        if any(x in kh for x in ("min", "minute")):
+            return int(round(v))
+        # heuristic: if it's big, assume seconds
+        if v > 600:  # >10 minutes → likely seconds
+            return int(round(v / 60.0))
+        return int(round(v))
+
+    # String forms
+    if isinstance(val, str):
+        s = val.strip().lower()
+
+        # ISO-8601 like PT1H23M45S
+        m = re.match(r"^pt(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", s)
+        if m:
+            h = int(m.group(1) or 0)
+            mi = int(m.group(2) or 0)
+            se = int(m.group(3) or 0)
+            return h * 60 + mi + int(round(se / 60.0))
+
+        # hh:mm:ss or mm:ss
+        m = re.match(r"^(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$", s)
+        if m:
+            h = int(m.group(1) or 0)
+            mi = int(m.group(2) or 0)
+            se = int(m.group(3) or 0)
+            return h * 60 + mi + int(round(se / 60.0))
+
+        # textual "1 h 23 m", "83 min", "5000 s"
+        h = re.search(r"(\d+)\s*h", s)
+        mi = re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?\b", s)
+        se = re.search(r"(\d+)\s*s(?:ec(?:ond)?s?)?\b", s)
+        if h or mi or se:
+            total = 0
+            if h: total += int(h.group(1)) * 60
+            if mi: total += int(mi.group(1))
+            if se: total += int(round(int(se.group(1)) / 60.0))
+            if total > 0:
+                return total
+
+        # bare number + unit inside the same string
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(min|mins|minute|minutes|m)\b", s)
+        if m:
+            return int(round(float(m.group(1))))
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(sec|secs|second|seconds|s)\b", s)
+        if m:
+            return int(round(float(m.group(1)) / 60.0))
+
+        # bare number: fall back with key hint
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*$", s)
+        if m:
+            v = float(m.group(1))
+            return parse_duration_minutes(v, key_hint)
+
+    # Unknown type
+    return None
+
 def parse_hevy_share(url: str) -> dict:
     # Short timeouts + retries + Referer so we fail fast and get clearer errors
     with httpx.Client(
@@ -276,6 +382,7 @@ def parse_hevy_share(url: str) -> dict:
 
     for root in data_sources:
         for node in walk_obj(root):
+            # --- exercises ---
             ex = node.get("exercises") or node.get("workoutExercises") or node.get("setsByExercise")
             if isinstance(ex, list) and ex:
                 for e in ex:
@@ -289,25 +396,31 @@ def parse_hevy_share(url: str) -> dict:
                         parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            if duration_minutes is None:
-                if "durationMinutes" in node:
-                    duration_minutes = int(_num_from_any(node.get("durationMinutes")) or 0)
-                elif "workoutDuration" in node:
-                    duration_minutes = int(_num_from_any(node.get("workoutDuration")) or 0)
-                elif "durationSec" in node or "durationSeconds" in node:
-                    secs = _num_from_any(node.get("durationSec") or node.get("durationSeconds"))
-                    if secs is not None:
-                        duration_minutes = int(round(secs / 60))
-                elif "duration" in node and isinstance(node.get("duration"), (int, float, str, dict)):
-                    duration_minutes = int(_num_from_any(node.get("duration")) or 0)
+            # --- duration: scan *all* keys that look like duration/time/elapsed ---
+            if duration_minutes is None and isinstance(node, dict):
+                for k, v in node.items():
+                    kl = str(k).lower()
+                    if any(key in kl for key in ("duration", "time", "elapsed")):
+                        mins = parse_duration_minutes(v, key_hint=kl)
+                        if mins is not None and mins > 0:
+                            duration_minutes = mins
+                            break  # keep the first plausible hit
 
+            # --- date/time (unchanged) ---
             if not wdate:
                 wdate = node.get("date") or node.get("startTime") or node.get("startDate") or node.get("workoutDate")
 
-    if not wdate:
-        meta_date = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("time")
-        if meta_date:
-            wdate = meta_date.get("content") or meta_date.get_text(strip=True)
+    # Fallback: try to pull an ISO-8601 duration or textual duration directly from the HTML if still missing
+    if duration_minutes is None:
+        html_lower = html.lower()
+        m = re.search(r"pt(?:\d+h)?(?:\d+m)?(?:\d+s)?", html_lower)
+        if m:
+            duration_minutes = parse_duration_minutes(m.group(0))
+    if duration_minutes is None:
+        # simple textual fallback like "83 min", "1 h 23 m"
+        m = re.search(r"(\d+)\s*h(?:\s*(\d+)\s*m)?", html_lower) or re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?\b", html_lower)
+        if m:
+            duration_minutes = parse_duration_minutes(m.group(0))
 
     total_volume = 0
     for e in exercises:
