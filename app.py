@@ -398,6 +398,14 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
         n += 1
     return {"ok": True, "rows": n}
 
+@app.get("/debug/workouts")
+def debug_workouts(user_name: Optional[str] = None, limit: int = 10, db: Session = Depends(get_db)):
+    q = db.query(HevyWorkout, User).join(User, HevyWorkout.user_id == User.id)
+    if user_name:
+        q = q.filter(User.name == user_name)
+    rows = q.order_by(HevyWorkout.id.desc()).limit(limit).all()
+    return [{"user": u.name, "date": w.date.isoformat(), "volume": w.total_volume, "url": w.source_url} for (w, u) in rows]
+
 # --- tiny debug endpoints ---
 @app.get("/debug/hevy")
 def debug_hevy(url: str):
