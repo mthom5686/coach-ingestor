@@ -1,0 +1,47 @@
+version: "3.8"
+
+services:
+  coachdb:
+    image: postgres:15
+    container_name: coachdb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: coach
+      POSTGRES_USER: coach
+      POSTGRES_PASSWORD: coachpass
+      TZ: ${TZ:-America/Chicago}
+    volumes:
+      - coachdb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coach -d coach"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - coach-net
+
+  ingestor:
+    build: .
+    container_name: coach-ingestor
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-America/Chicago}
+      DB_HOST: coachdb
+      DB_PORT: "5432"
+      DB_NAME: coach
+      DB_USER: coach
+      DB_PASS: coachpass
+    depends_on:
+      coachdb:
+        condition: service_healthy
+    ports:
+      - "8085:8008"   # API at http://<your-server>:8085
+    networks:
+      - coach-net
+
+volumes:
+  coachdb_data:
+
+networks:
+  coach-net:
+    driver: bridge
