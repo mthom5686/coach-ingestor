@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 import os, io, csv, json, re
 import httpx
 from bs4 import BeautifulSoup
@@ -245,3 +247,167 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
                          calories=calories, carbs_g=carbs, fat_g=fat, source="csv")
         n += 1
     return {"ok": True, "rows": n}
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>LiftCrew – Submit</title>
+    <!-- Clean, modern styling with zero build step -->
+    <link rel="stylesheet" href="https://unpkg.com/@picocss/pico@2/css/pico.min.css">
+    <style>
+      .container { max-width: 880px; margin: 2rem auto; }
+      .card { padding: 1.25rem; border: 1px solid #e7e7e9; border-radius: 12px; }
+      .grid { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+      @media (min-width: 860px){ .grid { grid-template-columns: 1fr 1fr; } }
+      .toast { position: fixed; top: 14px; right: 14px; background: #0ea5e9; color: white; padding: .75rem 1rem; border-radius: 10px; display:none; }
+      .toast.error { background:#ef4444; }
+      .muted { color: #6b7280; }
+      .brand { font-weight: 700; font-size: 1.2rem; }
+      footer { margin-top: 2rem; color:#6b7280; font-size:.9rem; }
+      .kbd { background:#f1f5f9; border-radius:8px; padding:.15rem .4rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    </style>
+  </head>
+  <body>
+    <div class="toast" id="toast"></div>
+    <header class="container">
+      <nav>
+        <ul>
+          <li class="brand">🏋️ LiftCrew</li>
+        </ul>
+        <ul>
+          <li><a href="/docs" target="_blank">API</a></li>
+          <li><a href="#dashboard" id="dashLink">Dashboard</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main class="container">
+      <h2>Log your stuff, win the week 💪</h2>
+      <p class="muted">Paste your Hevy share link or log today’s protein. It’s quick.</p>
+
+      <div class="grid">
+        <!-- Hevy submit -->
+        <section class="card">
+          <h3>Share a Hevy workout</h3>
+          <form id="hevyForm">
+            <label for="hevyUser">Who are you?</label>
+            <select id="hevyUser" required></select>
+
+            <label for="hevyUrl">Hevy share link</label>
+            <input id="hevyUrl" type="url" placeholder="https://hevy.app/workout/ABC123" required />
+
+            <button type="submit">Submit workout</button>
+            <small class="muted">Tip: in Hevy tap <span class="kbd">Share</span> → <span class="kbd">Copy link</span>.</small>
+          </form>
+        </section>
+
+        <!-- Protein log -->
+        <section class="card">
+          <h3>Log protein for today</h3>
+          <form id="protForm">
+            <label for="protUser">Who are you?</label>
+            <select id="protUser" required></select>
+
+            <label for="protDate">Date</label>
+            <input id="protDate" type="date" required />
+
+            <label for="protG">Protein (g)</label>
+            <input id="protG" type="number" min="0" step="1" placeholder="e.g. 180" required />
+
+            <button type="submit">Save protein</button>
+            <small class="muted">You can upload CSVs in the API docs later.</small>
+          </form>
+        </section>
+      </div>
+
+      <section id="dashboard" style="margin-top:2rem;">
+        <h3>Team dashboard</h3>
+        <p class="muted">Open the shared Grafana board:</p>
+        <a id="grafanaHref" class="secondary" target="_blank" href="#">Open Grafana</a>
+        <!-- Want to embed? Replace the href + uncomment the iframe below -->
+        <!--
+        <div style="margin-top:1rem;">
+          <iframe src="https://YOUR-GRAFANA-HOST/d/ABC123/your-board?orgId=1&kiosk"
+                  width="100%" height="720" frameborder="0"></iframe>
+        </div>
+        -->
+      </section>
+
+      <footer>
+        <p>Pro tip: save this page to your phone’s home screen for 1-tap logging.</p>
+      </footer>
+    </main>
+
+    <script>
+    const API = window.location.origin; // same host/port
+    const toast = document.getElementById('toast');
+    function showToast(msg, isErr=false){
+      toast.textContent = msg; toast.className = 'toast' + (isErr?' error':'');
+      toast.style.display = 'block'; setTimeout(()=>toast.style.display='none', 2600);
+    }
+
+    async function loadUsers() {
+      try {
+        const res = await fetch(API + '/users');
+        const users = await res.json();
+        for (const id of ['hevyUser','protUser']) {
+          const sel = document.getElementById(id);
+          sel.innerHTML = '';
+          users.forEach(u => {
+            const opt = document.createElement('option');
+            opt.value = u.name; opt.textContent = u.name;
+            sel.appendChild(opt);
+          });
+        }
+      } catch (e) { showToast('Could not load users', true); }
+    }
+
+    // If you have a Grafana URL, set it here for the button
+    document.getElementById('grafanaHref').href = 'https://YOUR-GRAFANA-HOST/d/ABC123/your-board';
+
+    // Hevy submit
+    document.getElementById('hevyForm').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const user = document.getElementById('hevyUser').value;
+      const url = document.getElementById('hevyUrl').value.trim();
+      try {
+        const res = await fetch(API + '/ingest/hevy', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({user_name: user, url})
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        showToast(`Saved: ${data.total_volume?.toLocaleString()} total volume`);
+        document.getElementById('hevyUrl').value = '';
+      } catch(err){ showToast('Submit failed', true); }
+    });
+
+    // Protein submit
+    document.getElementById('protForm').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const user = document.getElementById('protUser').value;
+      const d = document.getElementById('protDate').value;
+      const g = parseInt(document.getElementById('protG').value || '0', 10);
+      try {
+        const res = await fetch(API + '/ingest/nutrition/manual', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({user_name: user, date: d, protein_g: g})
+        });
+        if (!res.ok) throw new Error(await res.text());
+        showToast('Protein saved!');
+        document.getElementById('protG').value = '';
+      } catch(err){ showToast('Save failed', true); }
+    });
+
+    // Defaults: set date to today; load users
+    document.getElementById('protDate').valueAsDate = new Date();
+    loadUsers();
+    </script>
+  </body>
+</html>
+    """
