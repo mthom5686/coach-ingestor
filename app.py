@@ -31,6 +31,8 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
+LB_PER_KG = 2.2046226218
+
 # =========================
 # Models
 # =========================
@@ -40,11 +42,7 @@ class User(Base):
     name = Column(String, unique=True, nullable=False)
     protein_target = Column(Integer, nullable=True)
 
-    # new goal fields (added at runtime via ALTER TABLE IF NOT EXISTS)
-    # stored as columns but defined here for ORM usage
-    # (metadata.create_all doesn't add columns to existing table, so we DDL them at startup)
-    # types match the ALTER TABLE below:
-    # goal_weight_kg: Numeric(6,2)   goal_date: Date
+    # optional goal fields
     goal_weight_kg = Column(Numeric(6, 2), nullable=True)
     goal_date = Column(Date, nullable=True)
 
@@ -62,7 +60,8 @@ class HevyWorkout(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     date = Column(Date, index=True, nullable=False)
     duration_minutes = Column(Integer, nullable=True)
-    total_volume = Column(BigInteger, nullable=True)
+    total_volume = Column(BigInteger, nullable=True)       # kg*reps
+    total_volume_lb = Column(BigInteger, nullable=True)    # lb*reps
     source_url = Column(String, nullable=False)
     raw = Column(JSON, nullable=True)
     user = relationship("User", back_populates="workouts")
@@ -87,6 +86,7 @@ class WeightLog(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     date = Column(Date, index=True, nullable=False)
     weight_kg = Column(Numeric(6, 2), nullable=False)
+    weight_lb = Column(Numeric(6, 2), nullable=True)
     source = Column(String, nullable=True)
     user = relationship("User", back_populates="weight_logs")
     __table_args__ = (UniqueConstraint("user_id", "date", name="uq_weight_user_date"),)
@@ -94,11 +94,24 @@ class WeightLog(Base):
 # Create tables that don't exist
 Base.metadata.create_all(bind=engine)
 
-# Add new columns to users table if missing
+# Migrate/Backfill new columns if missing
 def init_schema():
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_weight_kg numeric(6,2)"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS goal_date date"))
+        conn.execute(text("ALTER TABLE weight_logs ADD COLUMN IF NOT EXISTS weight_lb numeric(6,2)"))
+        conn.execute(text("ALTER TABLE hevy_workouts ADD COLUMN IF NOT EXISTS total_volume_lb bigint"))
+        # backfill lbs if null
+        conn.execute(text("""
+            UPDATE weight_logs
+               SET weight_lb = ROUND((weight_kg * :k), 2)
+             WHERE weight_lb IS NULL AND weight_kg IS NOT NULL
+        """), {"k": LB_PER_KG})
+        conn.execute(text("""
+            UPDATE hevy_workouts
+               SET total_volume_lb = CAST(ROUND(total_volume * :k) AS bigint)
+             WHERE total_volume_lb IS NULL AND total_volume IS NOT NULL
+        """), {"k": LB_PER_KG})
 
 init_schema()
 
@@ -134,7 +147,8 @@ class HevyWorkoutOut(BaseModel):
     user_name: str
     date: date
     duration_minutes: Optional[int]
-    total_volume: Optional[int]
+    total_volume: Optional[int]        # kg*reps (legacy)
+    total_volume_lb: Optional[int]     # lb*reps (use this)
 
 class NutritionManualIn(BaseModel):
     user_name: str
@@ -147,12 +161,12 @@ class NutritionManualIn(BaseModel):
 class WeightManualIn(BaseModel):
     user_name: str
     date: date
-    weight_kg: float
+    weight_lb: float                    # API now accepts pounds
 
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI(title="Coach Ingestor API (single-file)", version="0.2.0")
+app = FastAPI(title="Coach Ingestor API (single-file)", version="0.2.1")
 
 def get_db():
     db = SessionLocal()
@@ -183,7 +197,7 @@ def get_or_create_user(db: Session, name: str, **kwargs) -> User:
     db.refresh(u)
     return u
 
-def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volume: int|None, url: str, raw: dict|None):
+def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volume_kg: int|None, url: str, raw: dict|None):
     safe_raw = None
     if raw is not None:
         safe_raw = jsonable_encoder(
@@ -193,11 +207,13 @@ def create_workout(db: Session, user_id: int, dt: date, duration: int|None, volu
                 datetime: lambda v: v.isoformat(),
             },
         )
+    volume_lb = int(round((volume_kg or 0) * LB_PER_KG)) if volume_kg is not None else None
     w = HevyWorkout(
         user_id=user_id,
         date=dt,
         duration_minutes=duration,
-        total_volume=volume,
+        total_volume=volume_kg,
+        total_volume_lb=volume_lb,
         source_url=url,
         raw=safe_raw,
     )
@@ -213,13 +229,17 @@ def upsert_nutrition(db: Session, user_id: int, dt: date, protein_g: int|None, c
     log.protein_g, log.calories, log.carbs_g, log.fat_g, log.source = protein_g, calories, carbs_g, fat_g, source
     db.commit(); db.refresh(log); return log
 
-def upsert_weight(db: Session, user_id: int, dt: date, weight_kg: float|Decimal, source: str="manual"):
+def upsert_weight(db: Session, user_id: int, dt: date, weight_lb: float|Decimal, source: str="manual"):
+    # store both units; compute kg from lb
+    lb = Decimal(str(weight_lb))
+    kg = (lb / Decimal(str(LB_PER_KG))).quantize(Decimal("0.01"))
     log = db.query(WeightLog).filter(WeightLog.user_id==user_id, WeightLog.date==dt).first()
     if not log:
-        log = WeightLog(user_id=user_id, date=dt, weight_kg=Decimal(str(weight_kg)), source=source)
+        log = WeightLog(user_id=user_id, date=dt, weight_kg=kg, weight_lb=lb, source=source)
         db.add(log)
     else:
-        log.weight_kg = Decimal(str(weight_kg))
+        log.weight_kg = kg
+        log.weight_lb = lb
         log.source = source
     db.commit(); db.refresh(log); return log
 
@@ -283,7 +303,7 @@ def _weight_kg_from_set(s: dict):
     looks_lb = ("lbs" in txt or " lb" in txt or unit in ("lb", "lbs", "pounds"))
     looks_kg = ("kg" in txt) or (unit in ("kg", "kilogram", "kilograms"))
     if val is None: return 0.0
-    if looks_lb and not looks_kg: return round(val * 0.45359237, 3)
+    if looks_lb and not looks_kg: return round(val / LB_PER_KG, 3)  # convert lbs->kg
     return float(val)
 
 def parse_duration_minutes(val, key_hint: str = "") -> int | None:
@@ -382,13 +402,13 @@ def parse_hevy_share(url: str) -> dict:
                         parsed_sets.append({"reps": reps, "weight_kg": wkg})
                     exercises.append({"name": name, "sets": parsed_sets})
 
-            # scan broadly for any duration/time/elapsed key
+            # duration scan
             if duration_minutes is None and isinstance(node, dict):
                 for k, v in node.items():
                     kl = str(k).lower()
                     if any(key in kl for key in ("duration", "time", "elapsed")):
                         mins = parse_duration_minutes(v, key_hint=kl)
-                        if mins is not None and 0 < mins < 600:  # sanity: ignore absurd values
+                        if mins is not None and 0 < mins < 600:
                             duration_minutes = mins
                             break
 
@@ -409,11 +429,14 @@ def parse_hevy_share(url: str) -> dict:
             if guess and 0 < guess < 600:
                 duration_minutes = guess
 
-    total_volume = 0
+    # volumes
+    total_volume_kg = 0
     for e in exercises:
         for s in e["sets"]:
-            total_volume += int(round((s.get("weight_kg") or 0) * (s.get("reps") or 0)))
+            total_volume_kg += int(round((s.get("weight_kg") or 0) * (s.get("reps") or 0)))
+    total_volume_lb = int(round(total_volume_kg * LB_PER_KG))
 
+    # date parse
     parsed_date = None
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
         try:
@@ -425,9 +448,10 @@ def parse_hevy_share(url: str) -> dict:
     return {
         "date": parsed_date or datetime.utcnow().date(),
         "duration_minutes": int(duration_minutes) if duration_minutes is not None else None,
-        "total_volume": int(total_volume),
+        "total_volume": int(total_volume_kg),      # kg*reps
+        "total_volume_lb": int(total_volume_lb),   # lb*reps
         "exercises": exercises,
-        "raw_hint": "Parsed from Hevy share (weights normalized to kg)",
+        "raw_hint": "Parsed from Hevy share (weights normalized to kg; volume_lb added)",
     }
 
 # =========================
@@ -478,6 +502,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
         existing.date = parsed["date"]
         existing.duration_minutes = parsed.get("duration_minutes")
         existing.total_volume = parsed.get("total_volume")
+        existing.total_volume_lb = parsed.get("total_volume_lb")
         existing.raw = safe_raw
         db.commit(); db.refresh(existing)
         w = existing
@@ -488,6 +513,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
                 date=parsed["date"],
                 duration_minutes=parsed.get("duration_minutes"),
                 total_volume=parsed.get("total_volume"),
+                total_volume_lb=parsed.get("total_volume_lb"),
                 source_url=body.url,
                 raw=safe_raw,
             )
@@ -503,6 +529,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
             existing.date = parsed["date"]
             existing.duration_minutes = parsed.get("duration_minutes")
             existing.total_volume = parsed.get("total_volume")
+            existing.total_volume_lb = parsed.get("total_volume_lb")
             existing.raw = safe_raw
             db.commit(); db.refresh(existing)
             w = existing
@@ -512,6 +539,7 @@ def ingest_hevy(body: HevyIn, db: Session = Depends(get_db)):
         date=w.date,
         duration_minutes=w.duration_minutes,
         total_volume=w.total_volume,
+        total_volume_lb=w.total_volume_lb,
     )
 
 @app.post("/ingest/nutrition/manual")
@@ -546,19 +574,22 @@ def ingest_nutrition_csv(user_name: str = Form(...), file: UploadFile = File(...
 @app.post("/ingest/weight/manual")
 def ingest_weight_manual(body: WeightManualIn, db: Session = Depends(get_db)):
     user = get_or_create_user(db, name=body.user_name)
-    upsert_weight(db, user_id=user.id, dt=body.date, weight_kg=body.weight_kg, source="manual")
+    upsert_weight(db, user_id=user.id, dt=body.date, weight_lb=body.weight_lb, source="manual")
     return {"ok": True}
 
 @app.post("/ingest/weight/csv")
 def ingest_weight_csv(user_name: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """
+    CSV headers: date,weight_lb   (in pounds)
+    """
     user = get_or_create_user(db, name=user_name)
     content = file.file.read().decode("utf-8")
     reader = csv.DictReader(io.StringIO(content))
     n = 0
     for row in reader:
         dt = date.fromisoformat(row["date"])
-        wkg = float(row["weight_kg"])
-        upsert_weight(db, user_id=user.id, dt=dt, weight_kg=wkg, source="csv")
+        wlb = float(row["weight_lb"])
+        upsert_weight(db, user_id=user.id, dt=dt, weight_lb=wlb, source="csv")
         n += 1
     return {"ok": True, "rows": n}
 
@@ -569,7 +600,7 @@ def debug_workouts(user_name: Optional[str] = None, limit: int = 10, db: Session
     if user_name:
         q = q.filter(User.name == user_name)
     rows = q.order_by(HevyWorkout.id.desc()).limit(limit).all()
-    return [{"user": u.name, "date": w.date.isoformat(), "volume": w.total_volume, "url": w.source_url} for (w, u) in rows]
+    return [{"user": u.name, "date": w.date.isoformat(), "volume_lb": w.total_volume_lb, "volume_kg": w.total_volume, "url": w.source_url} for (w, u) in rows]
 
 # --- debug: parse a hevy link without inserting
 @app.get("/debug/hevy")
@@ -580,7 +611,8 @@ def debug_hevy(url: str):
             "ok": True,
             "date": parsed.get("date").isoformat() if parsed.get("date") else None,
             "duration_minutes": parsed.get("duration_minutes"),
-            "total_volume": parsed.get("total_volume"),
+            "total_volume_lb": parsed.get("total_volume_lb"),
+            "total_volume_kg": parsed.get("total_volume"),
             "exercise_count": len(parsed.get("exercises") or []),
         }
     except Exception as e:
@@ -606,48 +638,9 @@ def debug_weight(user_name: Optional[str] = None, limit: int = 30, db: Session =
         q = q.filter(User.name == user_name)
     rows = q.order_by(WeightLog.date.desc()).limit(limit).all()
     return [
-        {"user": u.name, "date": w.date.isoformat(), "weight_kg": float(w.weight_kg)}
+        {"user": u.name, "date": w.date.isoformat(), "weight_lb": float(w.weight_lb) if w.weight_lb is not None else None, "weight_kg": float(w.weight_kg)}
         for (w, u) in rows
     ]
-
-# --- debug: pace calc (simple)
-@app.get("/debug/pace")
-def debug_pace(user_name: str, db: Session = Depends(get_db)):
-    u = db.query(User).filter(User.name == user_name).first()
-    if not u:
-        raise HTTPException(404, "user not found")
-    if not u.goal_date or not u.goal_weight_kg:
-        raise HTTPException(400, "set goal first via POST /users/goal")
-
-    # first and last weight
-    first = db.query(WeightLog).filter(WeightLog.user_id==u.id).order_by(WeightLog.date.asc()).first()
-    last  = db.query(WeightLog).filter(WeightLog.user_id==u.id).order_by(WeightLog.date.desc()).first()
-    if not first or not last:
-        raise HTTPException(400, "no weight logs")
-
-    start_w, start_d = float(first.weight_kg), first.date
-    last_w, last_d   = float(last.weight_kg), last.date
-    goal_w, goal_d   = float(u.goal_weight_kg), u.goal_date
-
-    total_days = max(1, (goal_d - start_d).days)
-    elapsed = (last_d - start_d).days
-    progress_ratio = (last_w - start_w) / (goal_w - start_w) if (goal_w - start_w) != 0 else 0.0
-    scheduled_days_by_now = progress_ratio * total_days
-    days_ahead = round(scheduled_days_by_now - elapsed, 1)
-
-    # scheduled weight for today
-    today = date.today()
-    t_elapsed = max(0, min(total_days, (today - start_d).days))
-    scheduled_today = start_w + (t_elapsed / total_days) * (goal_w - start_w)
-
-    return {
-        "user": u.name,
-        "start": {"date": start_d.isoformat(), "weight_kg": start_w},
-        "latest": {"date": last_d.isoformat(), "weight_kg": last_w},
-        "goal": {"date": goal_d.isoformat(), "weight_kg": goal_w},
-        "scheduled_today": round(scheduled_today, 2),
-        "days_ahead": days_ahead
-    }
 
 # --- debug: raw fetch tester
 @app.get("/debug/fetch")
@@ -706,7 +699,7 @@ def home():
 
     <main class="container">
       <h2>Log your stuff, win the week 💪</h2>
-      <p class="muted">Paste your Hevy share link, log your bodyweight, or today’s protein.</p>
+      <p class="muted">Paste your Hevy link, log bodyweight (lb), or protein.</p>
 
       <div class="grid">
         <section class="card">
@@ -724,7 +717,7 @@ def home():
         </section>
 
         <section class="card">
-          <h3>Log bodyweight</h3>
+          <h3>Log bodyweight (lb)</h3>
           <form id="weightForm">
             <label for="wUser">Who are you?</label>
             <select id="wUser" required></select>
@@ -732,8 +725,8 @@ def home():
             <label for="wDate">Date</label>
             <input id="wDate" type="date" required />
 
-            <label for="wKg">Weight (kg)</label>
-            <input id="wKg" type="number" min="20" max="400" step="0.1" placeholder="e.g. 82.4" required />
+            <label for="wLb">Weight (lb)</label>
+            <input id="wLb" type="number" min="50" max="900" step="0.1" placeholder="e.g. 183.4" required />
 
             <button type="submit">Save weight</button>
           </form>
@@ -792,7 +785,7 @@ def home():
       } catch (e) { showToast('Could not load users', true); }
     }
 
-    // Set your Grafana link (replace with your real /d/<UID>/<slug>)
+    // Set your Grafana link
     document.getElementById('grafanaHref').href =
       'http://100.89.255.16:3030/d/f2da7bd4-0c35-48d5-9185-e31f546d709d/fitness-goal-tracker?orgId=1&var-user=All&from=now-30d&to=now&kiosk';
     document.getElementById('dashLink').href = document.getElementById('grafanaHref').href;
@@ -810,25 +803,25 @@ def home():
         });
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
-        showToast(`Saved: ${data.total_volume?.toLocaleString()} total volume`);
+        showToast(`Saved: ${data.total_volume_lb?.toLocaleString()} lb·reps`);
         document.getElementById('hevyUrl').value = '';
       } catch(err){ showToast('Submit failed', true); }
     });
 
-    // Weight submit
+    // Weight submit (lb)
     document.getElementById('weightForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const user = document.getElementById('wUser').value;
       const d = document.getElementById('wDate').value;
-      const w = parseFloat(document.getElementById('wKg').value);
+      const w = parseFloat(document.getElementById('wLb').value);
       try {
         const res = await fetch(API + '/ingest/weight/manual', {
           method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({user_name: user, date: d, weight_kg: w})
+          body: JSON.stringify({user_name: user, date: d, weight_lb: w})
         });
         if (!res.ok) throw new Error(await res.text());
         showToast('Weight saved!');
-        document.getElementById('wKg').value = '';
+        document.getElementById('wLb').value = '';
       } catch(err){ showToast('Save failed', true); }
     });
 
